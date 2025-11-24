@@ -16,12 +16,12 @@ const (
 	MaxMessageHistoryAge = 30 * time.Minute // Prune messages older than this
 
 	// Engagement parameters - tuned for human-like behavior
-	BaseProbability       = 0.08            // 8% chance to respond to general chat
-	MentionProbability    = 0.95            // 95% chance when mentioned directly
-	QuestionProbability   = 0.25            // 25% chance when question detected
-	ConversationBoost     = 0.30            // +30% during active conversations
-	MinMessagesSinceReply = 5               // Wait at least 5 messages before responding again
-	MaxSilentMessages     = 24              // Forced response after 24 messages of silence
+	BaseProbability       = 0.03            // 3% chance to respond to general chat
+	MentionProbability    = 0.85            // 85% chance when mentioned directly
+	QuestionProbability   = 0.12            // 12% chance when question detected
+	ConversationBoost     = 0.15            // +15% during active conversations
+	MinMessagesSinceReply = 8               // Wait at least 8 messages before responding again
+	MaxSilentMessages     = 40              // Forced response after 40 messages of silence
 	MinTimeBetweenReplies = 8 * time.Second // Minimum 8s between responses
 
 	// Multiline response settings
