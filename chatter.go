@@ -14,6 +14,7 @@ import (
 type GraceBot struct {
 	groqClient  *groq.Client
 	botUsername string
+	botAliases  []string
 	ready       chan bool
 	cancel      context.CancelFunc
 	started     bool
@@ -30,13 +31,14 @@ type GraceBot struct {
 	lastBotSendTime        time.Time
 }
 
-func NewGraceBot(groqClient *groq.Client, systemPrompt, botUsername string) *GraceBot {
+func NewGraceBot(groqClient *groq.Client, systemPrompt, botUsername string, botAliases []string) *GraceBot {
 	return &GraceBot{
 		groqClient:             groqClient,
 		botUsername:            botUsername,
+		botAliases:             botAliases,
 		ready:                  make(chan bool, 1),
 		contextManager:         NewContextManager(systemPrompt, MaxContextTokens),
-		conversationManager:    NewConversationManager(),
+		conversationManager:    NewConversationManager(botAliases),
 		engagementDecider:      NewEngagementDecider(GetEngagementConfig()),
 		messagesSinceLastReply: 0,
 		knownPlayers:           make(map[string]bool),
@@ -139,7 +141,7 @@ func (gb *GraceBot) sendResponse(c *client.Client, conversation *ConversationSta
 	// Build messages for API
 	messages := gb.contextManager.BuildChatCompletionMessages(contextWindow, prompt)
 
-	// Call Groq API
+	// Call Groq API with higher token limit for multiline responses
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -147,7 +149,7 @@ func (gb *GraceBot) sendResponse(c *client.Client, conversation *ConversationSta
 		Model:       groq.ModelLlama318BInstant,
 		Messages:    messages,
 		Temperature: 0.85,
-		MaxTokens:   60,
+		MaxTokens:   MaxResponseTokens,
 	})
 
 	if err != nil {
@@ -160,19 +162,58 @@ func (gb *GraceBot) sendResponse(c *client.Client, conversation *ConversationSta
 		return
 	}
 
-	aiResponse := sanitizeChatMessage(response.Choices[0].Message.Content)
+	aiResponse := response.Choices[0].Message.Content
 
-	// Send message to Minecraft
-	if err := c.SendChatMessage(aiResponse); err != nil {
-		log.Printf("Failed to send chat message: %v", err)
+	// Split response into lines and send with random delays
+	gb.sendMultilineResponse(c, aiResponse)
+}
+
+// sendMultilineResponse splits a message into lines and sends each with a random delay
+func (gb *GraceBot) sendMultilineResponse(c *client.Client, message string) {
+	// Split by newlines
+	lines := strings.Split(message, "\n")
+
+	// Filter out empty lines and sanitize each line
+	validLines := make([]string, 0)
+	for _, line := range lines {
+		sanitized := sanitizeChatMessage(line)
+		if sanitized != "" {
+			validLines = append(validLines, sanitized)
+		}
+	}
+
+	if len(validLines) == 0 {
+		log.Printf("No valid lines to send after sanitization")
 		return
 	}
 
-	// Track bot's own message in history
-	gb.contextManager.AddMessage(gb.botUsername, aiResponse, true)
-	gb.lastBotSendTime = time.Now()
+	log.Printf("Sending %d-line response", len(validLines))
 
-	log.Printf("Bot responded: %s", aiResponse)
+	// Send each line with random delay
+	for i, line := range validLines {
+		// Send the message
+		if err := c.SendChatMessage(line); err != nil {
+			log.Printf("Failed to send chat message (line %d): %v", i+1, err)
+			continue
+		}
+
+		// Track bot's own message in history
+		gb.contextManager.AddMessage(gb.botUsername, line, true)
+		gb.lastBotSendTime = time.Now()
+
+		log.Printf("Bot responded (line %d/%d): %s", i+1, len(validLines), line)
+
+		// Wait random delay before next line (except after last line)
+		if i < len(validLines)-1 {
+			// Random delay between MultilineDelayMin and MultilineDelayMax
+			minMs := int(MultilineDelayMin.Milliseconds())
+			maxMs := int(MultilineDelayMax.Milliseconds())
+			delayMs := minMs + gb.engagementDecider.rng.Intn(maxMs-minMs+1)
+			delay := time.Duration(delayMs) * time.Millisecond
+			log.Printf("Waiting %v before next line...", delay)
+			time.Sleep(delay)
+		}
+	}
 }
 
 func (gb *GraceBot) AddMessage(username, content string) {
@@ -235,7 +276,7 @@ func (gb *GraceBot) Reset() {
 	gb.started = false
 	gb.ready = make(chan bool, 1)
 	gb.contextManager.Clear()
-	gb.conversationManager = NewConversationManager()
+	gb.conversationManager = NewConversationManager(gb.botAliases)
 	gb.engagementDecider.Reset()
 	gb.messagesSinceLastReply = 0
 	gb.knownPlayers = make(map[string]bool)

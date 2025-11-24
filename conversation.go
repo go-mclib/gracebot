@@ -20,19 +20,71 @@ type ConversationState struct {
 type ConversationManager struct {
 	conversations map[string]*ConversationState
 	mu            sync.RWMutex
+	botAliases    []string // Aliases that can trigger mentions
 }
 
-func NewConversationManager() *ConversationManager {
+func NewConversationManager(botAliases []string) *ConversationManager {
 	return &ConversationManager{
 		conversations: make(map[string]*ConversationState),
+		botAliases:    botAliases,
 	}
 }
 
 // DetectMention checks if a message mentions the bot (case-insensitive)
+// Checks both the bot name and configured aliases with word boundaries
 func (cm *ConversationManager) DetectMention(message, botName string) bool {
 	msgLower := strings.ToLower(message)
+
+	// Check bot name
 	botLower := strings.ToLower(botName)
-	return strings.Contains(msgLower, botLower)
+	if containsWord(msgLower, botLower) {
+		return true
+	}
+
+	// Check aliases
+	for _, alias := range cm.botAliases {
+		aliasLower := strings.ToLower(alias)
+		if containsWord(msgLower, aliasLower) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// containsWord checks if a message contains a word with word boundaries
+// This ensures "bot" matches but "AnotherBot" doesn't
+func containsWord(message, word string) bool {
+	if word == "" {
+		return false
+	}
+
+	// Word boundaries are: start/end of string, space, punctuation
+	wordBoundaryChars := " \t\n\r.,!?;:\"'()[]{}@#$%^&*-+=/<>"
+
+	idx := 0
+	for {
+		pos := strings.Index(message[idx:], word)
+		if pos == -1 {
+			return false
+		}
+
+		actualPos := idx + pos
+
+		// Check if character before is a word boundary (or start of string)
+		beforeOk := actualPos == 0 || strings.ContainsRune(wordBoundaryChars, rune(message[actualPos-1]))
+
+		// Check if character after is a word boundary (or end of string)
+		afterPos := actualPos + len(word)
+		afterOk := afterPos >= len(message) || strings.ContainsRune(wordBoundaryChars, rune(message[afterPos]))
+
+		if beforeOk && afterOk {
+			return true
+		}
+
+		// Continue searching after this match
+		idx = actualPos + 1
+	}
 }
 
 // UpdateConversation updates or creates a conversation state

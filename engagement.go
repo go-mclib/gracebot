@@ -170,12 +170,14 @@ func (ed *EngagementDecider) GenerateResponsePrompt(
 	isDirectMention bool,
 	recentMessages []Message,
 ) string {
+	baseInstruction := "\n\nYou can use multiple lines if needed (separate with newlines). Keep responses natural and conversational."
+
 	if isDirectMention {
-		return "You were directly mentioned. Respond naturally to the conversation with a brief, relevant message."
+		return "You were directly mentioned. Respond naturally to the conversation." + baseInstruction
 	}
 
 	if conversation != nil && conversation.IsActive && conversation.Engagement > 0.5 {
-		return "You're in an active conversation. Respond naturally and appropriately to continue the discussion."
+		return "You're in an active conversation. Respond naturally and appropriately to continue the discussion." + baseInstruction
 	}
 
 	// Check if last few messages contain questions
@@ -188,10 +190,10 @@ func (ed *EngagementDecider) GenerateResponsePrompt(
 	}
 
 	if hasQuestion {
-		return "There's a question in the recent conversation. You can respond if it's relevant, or just add to the conversation naturally."
+		return "There's a question in the recent conversation. You can respond if it's relevant, or just add to the conversation naturally." + baseInstruction
 	}
 
-	return "Join the conversation naturally with a brief message. Keep it casual and human-like."
+	return "Join the conversation naturally. Keep it casual and human-like." + baseInstruction
 }
 
 // Reset clears the engagement state

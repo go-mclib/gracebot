@@ -51,10 +51,15 @@ func main() {
 	mcClient.TreatTransferAsDisconnect = treatTransferAsDisconnect
 	mcClient.RegisterDefaultHandlers()
 
-	chatter := NewGraceBot(groqClient, cfg.SystemPrompt, mcClient.Username)
+	chatter := NewGraceBot(groqClient, cfg.SystemPrompt, mcClient.Username, cfg.BotAliases)
 	registerChatHandler(mcClient, chatter)
 	registerTransferHandler(mcClient, chatter)
 	chatter.StartWithCancel(mcClient)
+
+	// Log bot aliases if configured
+	if len(cfg.BotAliases) > 0 {
+		log.Printf("Bot aliases configured: %v", cfg.BotAliases)
+	}
 
 	done := make(chan error, 1)
 	go func() { done <- mcClient.ConnectAndStart(context.Background()) }()

@@ -20,9 +20,14 @@ const (
 	MentionProbability    = 0.95            // 95% chance when mentioned directly
 	QuestionProbability   = 0.25            // 25% chance when question detected
 	ConversationBoost     = 0.30            // +30% during active conversations
-	MinMessagesSinceReply = 5               // Wait at least 2 messages before responding again
-	MaxSilentMessages     = 24              // Forced response after 12 messages of silence
+	MinMessagesSinceReply = 5               // Wait at least 5 messages before responding again
+	MaxSilentMessages     = 24              // Forced response after 24 messages of silence
 	MinTimeBetweenReplies = 8 * time.Second // Minimum 8s between responses
+
+	// Multiline response settings
+	MultilineDelayMin = 2 * time.Second // Minimum delay between lines
+	MultilineDelayMax = 4 * time.Second // Maximum delay between lines
+	MaxResponseTokens = 150             // Max tokens for LLM response (allows multiline)
 
 	// Conversation tracking
 	ConversationTimeout = 2 * time.Minute // Conversation inactive after 2 min
@@ -33,6 +38,7 @@ type Config struct {
 	GroqAPIKey    string
 	SystemPrompt  string
 	AzureClientID string
+	BotAliases    []string // Aliases that can trigger the bot (e.g., "grace", "bot")
 }
 
 func LoadConfig() *Config {
@@ -40,7 +46,69 @@ func LoadConfig() *Config {
 		GroqAPIKey:    os.Getenv("GROQ_API_KEY"),
 		SystemPrompt:  os.Getenv("GROQ_SYSTEM_PROMPT"),
 		AzureClientID: os.Getenv("AZURE_CLIENT_ID"),
+		BotAliases:    GetBotAliases(),
 	}
+}
+
+// GetBotAliases returns the list of bot aliases from environment or defaults
+// Set via GROQ_BOT_ALIASES env var, comma-separated (e.g., "grace,bot")
+func GetBotAliases() []string {
+	aliasesEnv := os.Getenv("GROQ_BOT_ALIASES")
+	if aliasesEnv == "" {
+		return []string{} // No aliases by default
+	}
+
+	// Split by comma and trim whitespace
+	aliases := make([]string, 0)
+	for _, alias := range splitAndTrim(aliasesEnv, ",") {
+		if alias != "" {
+			aliases = append(aliases, alias)
+		}
+	}
+	return aliases
+}
+
+func splitAndTrim(s, sep string) []string {
+	parts := make([]string, 0)
+	for _, part := range splitString(s, sep) {
+		trimmed := trimSpace(part)
+		if trimmed != "" {
+			parts = append(parts, trimmed)
+		}
+	}
+	return parts
+}
+
+func splitString(s, sep string) []string {
+	if s == "" {
+		return []string{}
+	}
+	result := make([]string, 0)
+	current := ""
+	for _, r := range s {
+		if string(r) == sep {
+			result = append(result, current)
+			current = ""
+		} else {
+			current += string(r)
+		}
+	}
+	result = append(result, current)
+	return result
+}
+
+func trimSpace(s string) string {
+	start := 0
+	end := len(s)
+
+	for start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' || s[start] == '\r') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\n' || s[end-1] == '\r') {
+		end--
+	}
+
+	return s[start:end]
 }
 
 // GetEngagementConfig returns the engagement configuration
