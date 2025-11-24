@@ -29,6 +29,9 @@ type GraceBot struct {
 	messagesSinceLastReply int
 	knownPlayers           map[string]bool
 	lastBotSendTime        time.Time
+
+	// Immediate response trigger
+	immediateCheckTrigger chan bool
 }
 
 func NewGraceBot(groqClient *groq.Client, systemPrompt, botUsername string, botAliases []string) *GraceBot {
@@ -42,6 +45,7 @@ func NewGraceBot(groqClient *groq.Client, systemPrompt, botUsername string, botA
 		engagementDecider:      NewEngagementDecider(GetEngagementConfig()),
 		messagesSinceLastReply: 0,
 		knownPlayers:           make(map[string]bool),
+		immediateCheckTrigger:  make(chan bool, 10), // Buffered channel for immediate checks
 	}
 }
 
@@ -65,6 +69,9 @@ func (gb *GraceBot) Start(ctx context.Context, c *client.Client) {
 			log.Println("GraceBot stopped")
 			return
 		case <-ticker.C:
+			gb.checkAndRespond(c)
+		case <-gb.immediateCheckTrigger:
+			// Immediate response check triggered by mention
 			gb.checkAndRespond(c)
 		case <-decayTicker.C:
 			gb.conversationManager.DecayEngagement(EngagementDecayRate, ConversationTimeout)
@@ -218,11 +225,11 @@ func (gb *GraceBot) sendMultilineResponse(c *client.Client, message string) {
 
 func (gb *GraceBot) AddMessage(username, content string) {
 	gb.mu.Lock()
-	defer gb.mu.Unlock()
 
 	// Filter out bot's own messages from the handler
 	if gb.isBotMessage(username, content) {
 		log.Printf("Filtered echo - user: %q", username)
+		gb.mu.Unlock()
 		return
 	}
 
@@ -234,6 +241,9 @@ func (gb *GraceBot) AddMessage(username, content string) {
 
 	// Update conversation tracking
 	gb.conversationManager.UpdateConversation(username, content, gb.botUsername)
+
+	// Check if this message mentions the bot
+	isMention := gb.conversationManager.DetectMention(content, gb.botUsername)
 
 	// Update engagement decider
 	msg := Message{
@@ -248,6 +258,21 @@ func (gb *GraceBot) AddMessage(username, content string) {
 	gb.messagesSinceLastReply++
 
 	log.Printf("[%s] %s (msgs since reply: %d)", username, content, gb.messagesSinceLastReply)
+
+	gb.mu.Unlock()
+
+	// If bot was mentioned, trigger immediate response check
+	// This bypasses the normal ChatCheckInterval ticker
+	if isMention {
+		log.Printf("Bot mentioned - triggering immediate response check")
+		select {
+		case gb.immediateCheckTrigger <- true:
+			// Successfully triggered immediate check
+		default:
+			// Channel full, check will happen soon anyway
+			log.Printf("Immediate check channel full, will check on next tick")
+		}
+	}
 }
 
 func (gb *GraceBot) isBotMessage(username, content string) bool {
@@ -275,6 +300,7 @@ func (gb *GraceBot) Reset() {
 	gb.mu.Lock()
 	gb.started = false
 	gb.ready = make(chan bool, 1)
+	gb.immediateCheckTrigger = make(chan bool, 10)
 	gb.contextManager.Clear()
 	gb.conversationManager = NewConversationManager(gb.botAliases)
 	gb.engagementDecider.Reset()

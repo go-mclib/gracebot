@@ -43,8 +43,15 @@ func (ed *EngagementDecider) ShouldRespond(
 ) (bool, string) {
 	now := time.Now()
 
-	// Don't respond too frequently
-	if now.Sub(ed.lastResponseTime) < ed.minResponseInterval {
+	// Check if this is a recent direct mention (within 30 seconds)
+	isRecentMention := false
+	if conversation != nil && conversation.IsActive {
+		timeSinceMention := now.Sub(conversation.LastMentionTime)
+		isRecentMention = timeSinceMention < 30*time.Second
+	}
+
+	// Don't respond too frequently (UNLESS directly mentioned)
+	if !isRecentMention && now.Sub(ed.lastResponseTime) < ed.minResponseInterval {
 		return false, "too soon since last response"
 	}
 
@@ -54,9 +61,15 @@ func (ed *EngagementDecider) ShouldRespond(
 		return true, "forced engagement - too many silent messages"
 	}
 
-	// Don't respond too quickly
-	if messagesSinceLastReply < ed.config.MinMessagesSinceReply {
+	// Don't respond too quickly (UNLESS directly mentioned)
+	if !isRecentMention && messagesSinceLastReply < ed.config.MinMessagesSinceReply {
 		return false, "not enough messages since last reply"
+	}
+
+	// Direct mentions should always respond immediately
+	if isRecentMention {
+		ed.lastResponseTime = now
+		return true, "direct mention - responding immediately"
 	}
 
 	// Detect if player is talking to someone else
@@ -71,15 +84,10 @@ func (ed *EngagementDecider) ShouldRespond(
 	// Calculate response probability
 	probability := ed.config.BaseProbability
 
-	// Boost for direct mentions
+	// Boost for active conversations (mentions already handled above)
 	if conversation != nil && conversation.IsActive {
-		timeSinceMention := now.Sub(conversation.LastMentionTime)
-		if timeSinceMention < 30*time.Second {
-			probability = ed.config.MentionProbability
-		} else {
-			// Active conversation boost
-			probability += ed.config.ConversationBoost * conversation.Engagement
-		}
+		// Active conversation boost
+		probability += ed.config.ConversationBoost * conversation.Engagement
 	}
 
 	// Boost for questions
