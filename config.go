@@ -8,18 +8,18 @@ import (
 const (
 	// Timing constants
 	ChatCheckInterval = 10 * time.Second // How often to check if we should respond
-	InitialDelay      = 1 * time.Second // Delay before bot starts monitoring chat
-	MaxMessageLen     = 255             // Minecraft chat message length limit
+	InitialDelay      = 1 * time.Second  // Delay before bot starts monitoring chat
+	MaxMessageLen     = 255              // Minecraft chat message length limit
 
 	// Context management
 	MaxContextTokens     = 6000             // Max tokens for context window (leave room for model limits)
 	MaxMessageHistoryAge = 30 * time.Minute // Prune messages older than this
 
 	// Engagement parameters - tuned for human-like behavior
-	BaseProbability       = 0.03            // 3% chance to respond to general chat
-	MentionProbability    = 0.85            // 85% chance when mentioned directly
-	QuestionProbability   = 0.12            // 12% chance when question detected
-	ConversationBoost     = 0.15            // +15% during active conversations
+	BaseProbability       = 0.03            // 3 % chance to respond to general chat
+	MentionProbability    = 1.0             // 100 % chance when mentioned directly
+	QuestionProbability   = 0.12            // 12 % chance when question detected
+	ConversationBoost     = 0.15            // +15 % during active conversations
 	MinMessagesSinceReply = 8               // Wait at least 8 messages before responding again
 	MaxSilentMessages     = 40              // Forced response after 40 messages of silence
 	MinTimeBetweenReplies = 8 * time.Second // Minimum 8s between responses
