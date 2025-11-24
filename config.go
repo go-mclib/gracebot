@@ -7,7 +7,7 @@ import (
 
 const (
 	// Timing constants
-	ChatCheckInterval = 2 * time.Second // How often to check if we should respond
+	ChatCheckInterval = 10 * time.Second // How often to check if we should respond
 	InitialDelay      = 1 * time.Second // Delay before bot starts monitoring chat
 	MaxMessageLen     = 255             // Minecraft chat message length limit
 
