@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"strings"
 
 	"github.com/go-mclib/client/client"
@@ -16,9 +17,14 @@ func registerChatHandler(c *client.Client, chatter *GraceBot) {
 			if err := jp.BytesToPacketData(pkt.Data, &d); err == nil {
 				sender := d.SenderName.GetText()
 				message := string(d.Message)
+				log.Printf("DEBUG: PlayerChat packet - sender=%q, message=%q", sender, message)
 				if sender != "" && message != "" && !shouldFilterMessage(message) {
 					chatter.AddMessage(sender, message, false)
+				} else {
+					log.Printf("DEBUG: PlayerChat filtered - empty=%v, filtered=%v", sender == "" || message == "", shouldFilterMessage(message))
 				}
+			} else {
+				log.Printf("DEBUG: PlayerChat parse error: %v", err)
 			}
 		}
 
@@ -27,9 +33,26 @@ func registerChatHandler(c *client.Client, chatter *GraceBot) {
 			var d packets.S2CSystemChatData
 			if err := jp.BytesToPacketData(pkt.Data, &d); err == nil {
 				content := d.Content.GetText()
+				log.Printf("DEBUG: SystemChat packet - content=%q", content)
+
+				// check for chat chain broken - triggers reconnect
+				if strings.Contains(content, "chat.disabled.chain_broken") {
+					log.Printf("Chat chain broken detected - triggering reconnect (preserving context)")
+					go func() {
+						if err := c.Disconnect(false); err != nil {
+							log.Printf("Failed to disconnect for reconnect: %v", err)
+						}
+					}()
+					return
+				}
+
 				if content != "" && !shouldFilterMessage(content) {
 					chatter.AddMessage("Server", content, true)
+				} else {
+					log.Printf("DEBUG: SystemChat filtered - empty=%v, filtered=%v", content == "", shouldFilterMessage(content))
 				}
+			} else {
+				log.Printf("DEBUG: SystemChat parse error: %v", err)
 			}
 		}
 	})
