@@ -45,8 +45,7 @@ func main() {
 		log.Fatalf("Failed to initialize Groq client: %v", err)
 	}
 
-	host, port := parseAddr(addr)
-	mcClient := client.NewClient(host, port, username, verbose, online, hasGravity, cfg.AzureClientID)
+	mcClient := client.NewClient(addr, username, verbose, online, hasGravity, cfg.AzureClientID)
 	mcClient.Interactive = interactive
 	mcClient.TreatTransferAsDisconnect = treatTransferAsDisconnect
 	mcClient.RegisterDefaultHandlers()
