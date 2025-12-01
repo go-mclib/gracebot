@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -14,8 +15,9 @@ import (
 
 const (
 	debounceInterval = 5 * time.Second
-	silenceMarker    = "[silence]"
-)	
+)
+
+var silenceMarkers = []string{"[silence]", "<silence>", "silence"}
 
 type ChatMessage struct {
 	Username  string
@@ -202,7 +204,7 @@ func (gb *GraceBot) respondToChat(forcedResponse bool) {
 	aiResponse := strings.TrimSpace(choice.Message.Content)
 
 	// if LLM decided not to respond (empty or special token), just clear log
-	if aiResponse == "" || aiResponse == silenceMarker {
+	if aiResponse == "" || slices.Contains(silenceMarkers, aiResponse) {
 		log.Printf("LLM decided not to respond")
 		gb.clearChatLog()
 		return
@@ -256,7 +258,7 @@ func (gb *GraceBot) handleToolCalls(ctx context.Context, messages []groq.ChatCom
 	aiResponse := strings.TrimSpace(response.Choices[0].Message.Content)
 
 	// if LLM decided not to respond, just clear log
-	if aiResponse == "" || aiResponse == silenceMarker {
+	if aiResponse == "" || slices.Contains(silenceMarkers, aiResponse) {
 		log.Printf("LLM decided not to respond after tool call")
 		gb.clearChatLog()
 		return
@@ -294,7 +296,7 @@ func (gb *GraceBot) buildSystemPrompt(forcedResponse bool) string {
 	if forcedResponse {
 		prompt += "\n\nYou were directly mentioned in the latest message. You MUST respond."
 	} else {
-		prompt += "\n\nHere are recent chat messages. If you have nothing to say, output: `" + silenceMarker + "` (no quotes)."
+		prompt += "\n\nHere are recent chat messages. If you have nothing to say, output: `" + strings.Join(silenceMarkers, "` or `") + "` (no quotes)."
 	}
 
 	return prompt
