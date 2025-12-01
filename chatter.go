@@ -12,7 +12,10 @@ import (
 	"github.com/go-mclib/client/client"
 )
 
-const debounceInterval = 5 * time.Second
+const (
+	debounceInterval = 5 * time.Second
+	silenceMarker    = "[silence]"
+)	
 
 type ChatMessage struct {
 	Username  string
@@ -30,10 +33,10 @@ type GraceBot struct {
 	mcClient     *client.Client
 	mu           sync.Mutex
 
-	chatLog      []ChatMessage
-	context      []groq.ChatCompletionMessage
+	chatLog       []ChatMessage
+	context       []groq.ChatCompletionMessage
 	debounceTimer *time.Timer
-	stopCh       chan struct{}
+	stopCh        chan struct{}
 }
 
 func NewGraceBot(groqClient *groq.Client, systemPrompt, botUsername string, botAliases []string, maxChatLog int) *GraceBot {
@@ -191,7 +194,7 @@ func (gb *GraceBot) respondToChat(forcedResponse bool) {
 	aiResponse := strings.TrimSpace(choice.Message.Content)
 
 	// if LLM decided not to respond (empty or special token), just clear log
-	if aiResponse == "" || aiResponse == "[SILENCE]" || strings.ToLower(aiResponse) == "no response" {
+	if aiResponse == "" || aiResponse == silenceMarker {
 		log.Printf("LLM decided not to respond")
 		gb.clearChatLog()
 		return
@@ -238,7 +241,6 @@ func (gb *GraceBot) handleToolCalls(ctx context.Context, messages []groq.ChatCom
 		Tools:       tools,
 		ToolChoice:  "auto",
 	})
-
 	if err != nil {
 		log.Printf("Groq API error after tool call: %v", err)
 		gb.clearChatLog()
@@ -254,7 +256,7 @@ func (gb *GraceBot) handleToolCalls(ctx context.Context, messages []groq.ChatCom
 	aiResponse := strings.TrimSpace(response.Choices[0].Message.Content)
 
 	// if LLM decided not to respond, just clear log
-	if aiResponse == "" || aiResponse == "[SILENCE]" || strings.ToLower(aiResponse) == "no response" {
+	if aiResponse == "" || aiResponse == silenceMarker {
 		log.Printf("LLM decided not to respond after tool call")
 		gb.clearChatLog()
 		return
@@ -289,14 +291,12 @@ func (gb *GraceBot) buildAPIMessages(forcedResponse bool) []groq.ChatCompletionM
 
 func (gb *GraceBot) buildSystemPrompt(forcedResponse bool) string {
 	prompt := gb.systemPrompt
-
 	if forcedResponse {
 		prompt += "\n\nYou were directly mentioned in the latest message. You MUST respond."
 	} else {
-		prompt += "\n\nHere are recent chat messages. Respond if the conversation is interesting or relevant to you. If you don't want to respond, output '[SILENCE]'."
+		prompt += "\n\nHere are recent chat messages. If you have nothing to say, output: `" + silenceMarker + "` (no quotes)."
 	}
 
-	prompt += "\n\nFor multi-line responses, use newlines to separate sentences. Keep each line under 255 characters."
 	return prompt
 }
 
