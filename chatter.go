@@ -69,6 +69,23 @@ func (gb *GraceBot) Stop() {
 	gb.mu.Unlock()
 }
 
+// callChatCompletion is a generalized method for making chat completion requests
+func (gb *GraceBot) callChatCompletion(ctx context.Context, messages []groq.ChatCompletionMessage) (*groq.ChatCompletionResponse, error) {
+	tools := GetAllTools()
+
+	response, err := gb.groqClient.ChatCompletion(ctx, groq.ChatCompletionRequest{
+		Model:             "llama-3.3-70b-versatile",
+		Messages:          messages,
+		Temperature:       0.5,
+		MaxTokens:         512,
+		Tools:             tools,
+		ToolChoice:        "auto",
+		ParallelToolCalls: true,
+	})
+
+	return &response, err
+}
+
 // resetDebounceTimer resets or creates the debounce timer
 func (gb *GraceBot) resetDebounceTimer() {
 	if gb.debounceTimer != nil {
@@ -159,16 +176,7 @@ func (gb *GraceBot) respondToChat(forcedResponse bool) {
 
 	log.Printf("Sending %d chat messages + %d context messages to LLM (forced: %v)", len(gb.chatLog), len(gb.context), forcedResponse)
 
-	// Include tools in the request
-	tools := GetAllTools()
-	response, err := gb.groqClient.ChatCompletion(ctx, groq.ChatCompletionRequest{
-		Model:       groq.ModelLlama318BInstant,
-		Messages:    messages,
-		Temperature: 0.85,
-		MaxTokens:   512,
-		Tools:       tools,
-		ToolChoice:  "auto", // Let model decide when to use tools
-	})
+	response, err := gb.callChatCompletion(ctx, messages)
 	if err != nil {
 		log.Printf("Groq API error: %v", err)
 		// on error, clear chat log anyway to avoid getting stuck
@@ -232,15 +240,7 @@ func (gb *GraceBot) handleToolCalls(ctx context.Context, messages []groq.ChatCom
 	}
 
 	// get final response from LLM with tool results
-	tools := GetAllTools()
-	response, err := gb.groqClient.ChatCompletion(ctx, groq.ChatCompletionRequest{
-		Model:       groq.ModelLlama318BInstant,
-		Messages:    messages,
-		Temperature: 0.85,
-		MaxTokens:   512,
-		Tools:       tools,
-		ToolChoice:  "auto",
-	})
+	response, err := gb.callChatCompletion(ctx, messages)
 	if err != nil {
 		log.Printf("Groq API error after tool call: %v", err)
 		gb.clearChatLog()
