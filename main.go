@@ -18,7 +18,7 @@ func main() {
 		log.Fatal("GROQ_API_KEY environment variable is not set")
 	}
 	if cfg.SystemPrompt == "" {
-		log.Fatal("GROQ_SYSTEM_PROMPT environment variable is not set")
+		log.Fatal("GROQ_SYSTEM_PROMPT or GROQ_SYSTEM_PROMPT_FILE must be set")
 	}
 
 	var (
@@ -50,14 +50,13 @@ func main() {
 	mcClient.TreatTransferAsDisconnect = treatTransferAsDisconnect
 	mcClient.RegisterDefaultHandlers()
 
-	chatter := NewGraceBot(groqClient, cfg.SystemPrompt, mcClient.Username, cfg.BotAliases)
+	chatter := NewGraceBot(groqClient, cfg.SystemPrompt, mcClient.Username, cfg.BotAliases, cfg.MaxChatLog)
+	chatter.SetClient(mcClient)
 	registerChatHandler(mcClient, chatter)
-	registerTransferHandler(mcClient, chatter)
-	chatter.StartWithCancel(mcClient)
 
-	// Log bot aliases if configured
+	log.Printf("Bot initialized - username: %s, max chat log: %d", mcClient.Username, cfg.MaxChatLog)
 	if len(cfg.BotAliases) > 0 {
-		log.Printf("Bot aliases configured: %v", cfg.BotAliases)
+		log.Printf("Bot aliases: %v", cfg.BotAliases)
 	}
 
 	done := make(chan error, 1)

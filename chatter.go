@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -11,176 +12,283 @@ import (
 	"github.com/go-mclib/client/client"
 )
 
+type ChatMessage struct {
+	Username  string
+	Content   string
+	Timestamp time.Time
+	IsSystem  bool // true for join/leave/death, false for player chat
+}
+
 type GraceBot struct {
-	groqClient  *groq.Client
-	botUsername string
-	botAliases  []string
-	ready       chan bool
-	cancel      context.CancelFunc
-	started     bool
-	mu          sync.Mutex
+	groqClient   *groq.Client
+	systemPrompt string
+	botUsername  string
+	botAliases   []string
+	maxChatLog   int
+	mcClient     *client.Client
+	mu           sync.Mutex
 
-	// New components
-	contextManager      *ContextManager
-	conversationManager *ConversationManager
-	engagementDecider   *EngagementDecider
-
-	// Tracking
-	messagesSinceLastReply int
-	knownPlayers           map[string]bool
-	lastBotSendTime        time.Time
-
-	// Immediate response trigger
-	immediateCheckTrigger chan bool
+	chatLog []ChatMessage
+	context []groq.ChatCompletionMessage
 }
 
-func NewGraceBot(groqClient *groq.Client, systemPrompt, botUsername string, botAliases []string) *GraceBot {
+func NewGraceBot(groqClient *groq.Client, systemPrompt, botUsername string, botAliases []string, maxChatLog int) *GraceBot {
 	return &GraceBot{
-		groqClient:             groqClient,
-		botUsername:            botUsername,
-		botAliases:             botAliases,
-		ready:                  make(chan bool, 1),
-		contextManager:         NewContextManager(systemPrompt, MaxContextTokens),
-		conversationManager:    NewConversationManager(botAliases),
-		engagementDecider:      NewEngagementDecider(GetEngagementConfig()),
-		messagesSinceLastReply: 0,
-		knownPlayers:           make(map[string]bool),
-		immediateCheckTrigger:  make(chan bool, 10), // Buffered channel for immediate checks
+		groqClient:   groqClient,
+		systemPrompt: systemPrompt,
+		botUsername:  botUsername,
+		botAliases:   botAliases,
+		maxChatLog:   maxChatLog,
+		chatLog:      make([]ChatMessage, 0, maxChatLog),
+		context:      make([]groq.ChatCompletionMessage, 0),
 	}
 }
 
-func (gb *GraceBot) Start(ctx context.Context, c *client.Client) {
-	<-gb.ready
-	log.Printf("GraceBot started - checking for engagement every %v", ChatCheckInterval)
-	time.Sleep(InitialDelay)
-
-	ticker := time.NewTicker(ChatCheckInterval)
-	defer ticker.Stop()
-
-	decayTicker := time.NewTicker(10 * time.Second)
-	defer decayTicker.Stop()
-
-	pruneTicker := time.NewTicker(5 * time.Minute)
-	defer pruneTicker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("GraceBot stopped")
-			return
-		case <-ticker.C:
-			gb.checkAndRespond(c)
-		case <-gb.immediateCheckTrigger:
-			// Immediate response check triggered by mention
-			gb.checkAndRespond(c)
-		case <-decayTicker.C:
-			gb.conversationManager.DecayEngagement(EngagementDecayRate, ConversationTimeout)
-		case <-pruneTicker.C:
-			gb.contextManager.PruneOldMessages(MaxMessageHistoryAge)
-		}
-	}
+// SetClient sets the Minecraft client reference
+func (gb *GraceBot) SetClient(c *client.Client) {
+	gb.mcClient = c
 }
 
-func (gb *GraceBot) checkAndRespond(c *client.Client) {
+// AddMessage adds a message to the chat log and triggers response if needed
+func (gb *GraceBot) AddMessage(username, content string, isSystem bool) {
 	gb.mu.Lock()
 	defer gb.mu.Unlock()
 
-	recentMessages := gb.contextManager.GetRecentMessages(5)
-	if len(recentMessages) == 0 {
+	// filter out bot's own messages
+	if gb.isBotMessage(username) {
+		log.Printf("Filtered bot echo - user: %q", username)
 		return
 	}
 
-	latestMessage := recentMessages[len(recentMessages)-1]
-
-	// Skip if this is the bot's own message
-	if latestMessage.IsBot {
-		return
+	msg := ChatMessage{
+		Username:  username,
+		Content:   content,
+		Timestamp: time.Now(),
+		IsSystem:  isSystem,
 	}
+	gb.chatLog = append(gb.chatLog, msg)
 
-	// Get or create conversation state
-	conversation := gb.conversationManager.GetConversation(latestMessage.Username)
+	isMentioned := gb.isMentioned(content)
+	log.Printf("[%s] %s (chat log: %d/%d, mentioned: %v)", username, content, len(gb.chatLog), gb.maxChatLog, isMentioned)
 
-	// Build list of other players for context
-	otherPlayers := make([]string, 0)
-	for player := range gb.knownPlayers {
-		if player != latestMessage.Username && player != gb.botUsername {
-			otherPlayers = append(otherPlayers, player)
+	shouldRespond := isMentioned || len(gb.chatLog) >= gb.maxChatLog
+	if shouldRespond {
+		gb.respondToChat(isMentioned)
+	}
+}
+
+func (gb *GraceBot) isMentioned(content string) bool {
+	contentLower := strings.ToLower(content)
+
+	if strings.Contains(contentLower, strings.ToLower(gb.botUsername)) {
+		return true
+	}
+	for _, alias := range gb.botAliases {
+		if strings.Contains(contentLower, alias) {
+			return true
 		}
 	}
 
-	// Decide if we should respond
-	shouldRespond, reason := gb.engagementDecider.ShouldRespond(
-		latestMessage,
-		conversation,
-		gb.messagesSinceLastReply,
-		otherPlayers,
-	)
+	return false
+}
 
-	if !shouldRespond {
-		log.Printf("Not responding: %s (msgs since reply: %d)", reason, gb.messagesSinceLastReply)
+func (gb *GraceBot) isBotMessage(username string) bool {
+	return strings.EqualFold(username, gb.botUsername)
+}
+
+// respondToChat sends the chat log to the LLM and responds if needed
+func (gb *GraceBot) respondToChat(forcedResponse bool) {
+	if len(gb.chatLog) == 0 {
 		return
 	}
 
-	log.Printf("Responding: %s (msgs since reply: %d)", reason, gb.messagesSinceLastReply)
-	gb.sendResponse(c, conversation, latestMessage)
-	gb.messagesSinceLastReply = 0
-}
-
-func (gb *GraceBot) sendResponse(c *client.Client, conversation *ConversationState, latestMessage Message) {
-	// Get conversation context
-	activeConversations := gb.conversationManager.GetActiveConversations()
-	contextWindow := gb.contextManager.GetContextWindow(activeConversations)
-
-	// Determine if this is a direct mention
-	isDirectMention := false
-	if conversation != nil {
-		timeSinceMention := time.Since(conversation.LastMentionTime)
-		isDirectMention = timeSinceMention < 30*time.Second
-	}
-
-	// Generate contextual prompt
-	prompt := gb.engagementDecider.GenerateResponsePrompt(
-		conversation,
-		isDirectMention,
-		contextWindow,
-	)
-
-	// Build messages for API
-	messages := gb.contextManager.BuildChatCompletionMessages(contextWindow, prompt)
-
-	// Call Groq API with higher token limit for multiline responses
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	messages := gb.buildAPIMessages(forcedResponse)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	log.Printf("Sending %d chat messages + %d context messages to LLM (forced: %v)", len(gb.chatLog), len(gb.context), forcedResponse)
+
+	// Include tools in the request
+	tools := GetAllTools()
 	response, err := gb.groqClient.ChatCompletion(ctx, groq.ChatCompletionRequest{
 		Model:       groq.ModelLlama318BInstant,
 		Messages:    messages,
 		Temperature: 0.85,
-		MaxTokens:   MaxResponseTokens,
+		MaxTokens:   512,
+		Tools:       tools,
+		ToolChoice:  "auto", // Let model decide when to use tools
 	})
-
 	if err != nil {
 		log.Printf("Groq API error: %v", err)
+		// on error, clear chat log anyway to avoid getting stuck
+		gb.clearChatLog()
 		return
 	}
 
 	if len(response.Choices) == 0 {
 		log.Printf("No response choices from API")
+		gb.clearChatLog()
 		return
 	}
 
-	aiResponse := response.Choices[0].Message.Content
+	choice := response.Choices[0]
 
-	// Split response into lines and send with random delays
-	gb.sendMultilineResponse(c, aiResponse)
+	// Check if LLM wants to use a tool
+	if len(choice.Message.ToolCalls) > 0 {
+		log.Printf("LLM requested %d tool call(s)", len(choice.Message.ToolCalls))
+		gb.handleToolCalls(ctx, messages, choice.Message)
+		return
+	}
+
+	aiResponse := strings.TrimSpace(choice.Message.Content)
+
+	// if LLM decided not to respond (empty or special token), just clear log
+	if aiResponse == "" || aiResponse == "[SILENCE]" || strings.ToLower(aiResponse) == "no response" {
+		log.Printf("LLM decided not to respond")
+		gb.clearChatLog()
+		return
+	}
+
+	gb.addChatLogToContext()
+
+	gb.mu.Unlock()
+	gb.SendResponseToMinecraft(aiResponse)
+	gb.mu.Lock()
 }
 
-// sendMultilineResponse splits a message into lines and sends each with a random delay
-func (gb *GraceBot) sendMultilineResponse(c *client.Client, message string) {
-	// Split by newlines
-	lines := strings.Split(message, "\n")
+// handleToolCalls executes tool calls and gets final response from LLM
+func (gb *GraceBot) handleToolCalls(ctx context.Context, messages []groq.ChatCompletionMessage, assistantMessage groq.ChatCompletionMessage) {
+	messages = append(messages, assistantMessage)
 
-	// Filter out empty lines and sanitize each line
+	// exec
+	for _, toolCall := range assistantMessage.ToolCalls {
+		log.Printf("Executing tool: %s with args: %s", toolCall.Function.Name, toolCall.Function.Arguments)
+
+		result, err := ExecuteTool(toolCall.Function.Name, toolCall.Function.Arguments, gb.mcClient)
+		if err != nil {
+			log.Printf("Tool execution error: %v", err)
+			result = fmt.Sprintf("Error: %v", err)
+		} else {
+			log.Printf("Tool result: %s", result)
+		}
+
+		// add tool result to messages
+		messages = append(messages, groq.ChatCompletionMessage{
+			Role:       groq.RoleTool,
+			Content:    result,
+			ToolCallID: toolCall.ID,
+		})
+	}
+
+	// get final response from LLM with tool results
+	tools := GetAllTools()
+	response, err := gb.groqClient.ChatCompletion(ctx, groq.ChatCompletionRequest{
+		Model:       groq.ModelLlama318BInstant,
+		Messages:    messages,
+		Temperature: 0.85,
+		MaxTokens:   512,
+		Tools:       tools,
+		ToolChoice:  "auto",
+	})
+
+	if err != nil {
+		log.Printf("Groq API error after tool call: %v", err)
+		gb.clearChatLog()
+		return
+	}
+
+	if len(response.Choices) == 0 {
+		log.Printf("No response choices from API after tool call")
+		gb.clearChatLog()
+		return
+	}
+
+	aiResponse := strings.TrimSpace(response.Choices[0].Message.Content)
+
+	// if LLM decided not to respond, just clear log
+	if aiResponse == "" || aiResponse == "[SILENCE]" || strings.ToLower(aiResponse) == "no response" {
+		log.Printf("LLM decided not to respond after tool call")
+		gb.clearChatLog()
+		return
+	}
+
+	gb.addChatLogToContext()
+
+	gb.mu.Unlock()
+	gb.SendResponseToMinecraft(aiResponse)
+	gb.mu.Lock()
+}
+
+// buildAPIMessages builds the messages array for the Groq API
+func (gb *GraceBot) buildAPIMessages(forcedResponse bool) []groq.ChatCompletionMessage {
+	messages := []groq.ChatCompletionMessage{
+		{
+			Role:    groq.RoleSystem,
+			Content: gb.buildSystemPrompt(forcedResponse),
+		},
+	}
+
+	messages = append(messages, gb.context...)
+
+	chatLogText := gb.formatChatLog()
+	messages = append(messages, groq.ChatCompletionMessage{
+		Role:    groq.RoleUser,
+		Content: chatLogText,
+	})
+
+	return messages
+}
+
+func (gb *GraceBot) buildSystemPrompt(forcedResponse bool) string {
+	prompt := gb.systemPrompt
+
+	if forcedResponse {
+		prompt += "\n\nYou were directly mentioned in the latest message. You MUST respond."
+	} else {
+		prompt += "\n\nThe chat log is full. Respond if the conversation is interesting or relevant to you. If you don't want to respond, output '[SILENCE]'."
+	}
+
+	prompt += "\n\nFor multi-line responses, use newlines to separate sentences. Keep each line under 255 characters."
+	return prompt
+}
+
+func (gb *GraceBot) formatChatLog() string {
+	var lines []string
+	for _, msg := range gb.chatLog {
+		if msg.IsSystem {
+			lines = append(lines, fmt.Sprintf("[SYSTEM] %s", msg.Content))
+		} else {
+			lines = append(lines, fmt.Sprintf("[%s] %s", msg.Username, msg.Content))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (gb *GraceBot) addChatLogToContext() {
+	chatLogText := gb.formatChatLog()
+	gb.context = append(gb.context, groq.ChatCompletionMessage{
+		Role:    groq.RoleUser,
+		Content: chatLogText,
+	})
+
+	// keep context limited to last 20 messages (10 exchanges)
+	if len(gb.context) > 20 {
+		gb.context = gb.context[len(gb.context)-20:]
+	}
+}
+
+func (gb *GraceBot) clearChatLog() {
+	gb.chatLog = make([]ChatMessage, 0, gb.maxChatLog)
+}
+
+// SendResponseToMinecraft sends multi-line response with typing delays
+func (gb *GraceBot) SendResponseToMinecraft(aiResponse string) {
+	if gb.mcClient == nil {
+		log.Printf("Minecraft client not set, cannot send response")
+		return
+	}
+
+	lines := strings.Split(aiResponse, "\n")
 	validLines := make([]string, 0)
 	for _, line := range lines {
 		sanitized := sanitizeChatMessage(line)
@@ -191,137 +299,47 @@ func (gb *GraceBot) sendMultilineResponse(c *client.Client, message string) {
 
 	if len(validLines) == 0 {
 		log.Printf("No valid lines to send after sanitization")
+		gb.clearChatLog()
 		return
 	}
 
 	log.Printf("Sending %d-line response", len(validLines))
 
-	// Send each line with random delay
+	// send each line with delay proportional to message length
 	for i, line := range validLines {
-		// Send the message
-		if err := c.SendChatMessage(line); err != nil {
+		if err := gb.mcClient.SendChatMessage(line); err != nil {
 			log.Printf("Failed to send chat message (line %d): %v", i+1, err)
 			continue
 		}
 
-		// Track bot's own message in history
-		gb.contextManager.AddMessage(gb.botUsername, line, true)
-		gb.lastBotSendTime = time.Now()
+		gb.context = append(gb.context, groq.ChatCompletionMessage{
+			Role:    groq.RoleAssistant,
+			Content: line,
+		})
 
 		log.Printf("Bot responded (line %d/%d): %s", i+1, len(validLines), line)
 
-		// Wait random delay before next line (except after last line)
+		// wait
 		if i < len(validLines)-1 {
-			// Random delay between MultilineDelayMin and MultilineDelayMax
-			minMs := int(MultilineDelayMin.Milliseconds())
-			maxMs := int(MultilineDelayMax.Milliseconds())
-			delayMs := minMs + gb.engagementDecider.rng.Intn(maxMs-minMs+1)
+			// base delay: 10ms per character, min 500ms, max 3000ms
+			delayMs := min(max(len(line)*10, 500), 3000)
 			delay := time.Duration(delayMs) * time.Millisecond
 			log.Printf("Waiting %v before next line...", delay)
 			time.Sleep(delay)
 		}
 	}
+
+	gb.clearChatLog()
 }
 
-func (gb *GraceBot) AddMessage(username, content string) {
-	gb.mu.Lock()
+func sanitizeChatMessage(message string) string {
+	// trim whitespace
+	message = strings.TrimSpace(message)
 
-	// Filter out bot's own messages from the handler
-	if gb.isBotMessage(username, content) {
-		log.Printf("Filtered echo - user: %q", username)
-		gb.mu.Unlock()
-		return
+	// limit to 255 characters (Minecraft limit)
+	if len(message) > 255 {
+		message = message[:255]
 	}
 
-	// Track known players
-	gb.knownPlayers[username] = true
-
-	// Add to context manager
-	gb.contextManager.AddMessage(username, content, false)
-
-	// Update conversation tracking
-	gb.conversationManager.UpdateConversation(username, content, gb.botUsername)
-
-	// Check if this message mentions the bot
-	isMention := gb.conversationManager.DetectMention(content, gb.botUsername)
-
-	// Update engagement decider
-	msg := Message{
-		Username:  username,
-		Content:   content,
-		Timestamp: time.Now(),
-		IsBot:     false,
-	}
-	gb.engagementDecider.UpdateRecentMessages(msg)
-
-	// Increment message counter
-	gb.messagesSinceLastReply++
-
-	log.Printf("[%s] %s (msgs since reply: %d)", username, content, gb.messagesSinceLastReply)
-
-	gb.mu.Unlock()
-
-	// If bot was mentioned, trigger immediate response check
-	// This bypasses the normal ChatCheckInterval ticker
-	if isMention {
-		log.Printf("Bot mentioned - triggering immediate response check")
-		select {
-		case gb.immediateCheckTrigger <- true:
-			// Successfully triggered immediate check
-		default:
-			// Channel full, check will happen soon anyway
-			log.Printf("Immediate check channel full, will check on next tick")
-		}
-	}
-}
-
-func (gb *GraceBot) isBotMessage(username, content string) bool {
-	// Check if username matches bot username (case-insensitive)
-	if strings.EqualFold(username, gb.botUsername) {
-		return true
-	}
-
-	// Check if it was sent very recently (within 1 second of bot sending)
-	timeSinceLastSent := time.Since(gb.lastBotSendTime)
-	if timeSinceLastSent < 1*time.Second {
-		log.Printf("Message too close to bot send time (%v), likely echo", timeSinceLastSent)
-		return true
-	}
-
-	return false
-}
-
-func (gb *GraceBot) Reset() {
-	if gb.cancel != nil {
-		log.Println("Server transfer detected, resetting GraceBot")
-		gb.cancel()
-	}
-
-	gb.mu.Lock()
-	gb.started = false
-	gb.ready = make(chan bool, 1)
-	gb.immediateCheckTrigger = make(chan bool, 10)
-	gb.contextManager.Clear()
-	gb.conversationManager = NewConversationManager(gb.botAliases)
-	gb.engagementDecider.Reset()
-	gb.messagesSinceLastReply = 0
-	gb.knownPlayers = make(map[string]bool)
-	gb.mu.Unlock()
-}
-
-func (gb *GraceBot) MarkReady() {
-	if !gb.started {
-		select {
-		case gb.ready <- true:
-			log.Println("First chat message received, GraceBot ready")
-			gb.started = true
-		default:
-		}
-	}
-}
-
-func (gb *GraceBot) StartWithCancel(c *client.Client) {
-	ctx, cancel := context.WithCancel(context.Background())
-	gb.cancel = cancel
-	go gb.Start(ctx, c)
+	return message
 }
