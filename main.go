@@ -46,6 +46,7 @@ func main() {
 	}
 
 	mcClient := client.NewClient(addr, username, verbose, online, hasGravity, cfg.AzureClientID)
+	mcClient.MaxReconnectAttempts = -1
 	mcClient.Interactive = interactive
 	mcClient.TreatTransferAsDisconnect = treatTransferAsDisconnect
 	mcClient.RegisterDefaultHandlers()
