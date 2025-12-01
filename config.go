@@ -15,7 +15,7 @@ type Config struct {
 }
 
 func LoadConfig() Config {
-	maxChatLog := 10 // default
+	maxChatLog := 30 // default
 	if val := os.Getenv("GROQ_MAX_CHAT_LOG"); val != "" {
 		if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
 			maxChatLog = parsed

@@ -12,6 +12,8 @@ import (
 	"github.com/go-mclib/client/client"
 )
 
+const debounceInterval = 5 * time.Second
+
 type ChatMessage struct {
 	Username  string
 	Content   string
@@ -28,12 +30,14 @@ type GraceBot struct {
 	mcClient     *client.Client
 	mu           sync.Mutex
 
-	chatLog []ChatMessage
-	context []groq.ChatCompletionMessage
+	chatLog      []ChatMessage
+	context      []groq.ChatCompletionMessage
+	debounceTimer *time.Timer
+	stopCh       chan struct{}
 }
 
 func NewGraceBot(groqClient *groq.Client, systemPrompt, botUsername string, botAliases []string, maxChatLog int) *GraceBot {
-	return &GraceBot{
+	gb := &GraceBot{
 		groqClient:   groqClient,
 		systemPrompt: systemPrompt,
 		botUsername:  botUsername,
@@ -41,12 +45,42 @@ func NewGraceBot(groqClient *groq.Client, systemPrompt, botUsername string, botA
 		maxChatLog:   maxChatLog,
 		chatLog:      make([]ChatMessage, 0, maxChatLog),
 		context:      make([]groq.ChatCompletionMessage, 0),
+		stopCh:       make(chan struct{}),
 	}
+
+	return gb
 }
 
 // SetClient sets the Minecraft client reference
 func (gb *GraceBot) SetClient(c *client.Client) {
 	gb.mcClient = c
+}
+
+// Stop stops the debounce timer
+func (gb *GraceBot) Stop() {
+	close(gb.stopCh)
+	gb.mu.Lock()
+	if gb.debounceTimer != nil {
+		gb.debounceTimer.Stop()
+	}
+	gb.mu.Unlock()
+}
+
+// resetDebounceTimer resets or creates the debounce timer
+func (gb *GraceBot) resetDebounceTimer() {
+	if gb.debounceTimer != nil {
+		gb.debounceTimer.Stop()
+	}
+
+	gb.debounceTimer = time.AfterFunc(debounceInterval, func() {
+		gb.mu.Lock()
+		defer gb.mu.Unlock()
+
+		if len(gb.chatLog) > 0 {
+			log.Printf("Debounce timer expired - sending %d accumulated messages", len(gb.chatLog))
+			gb.respondToChat(false)
+		}
+	})
 }
 
 // AddMessage adds a message to the chat log and triggers response if needed
@@ -68,12 +102,26 @@ func (gb *GraceBot) AddMessage(username, content string, isSystem bool) {
 	}
 	gb.chatLog = append(gb.chatLog, msg)
 
-	isMentioned := gb.isMentioned(content)
-	log.Printf("[%s] %s (chat log: %d/%d, mentioned: %v)", username, content, len(gb.chatLog), gb.maxChatLog, isMentioned)
+	// prevent unbounded growth - keep only recent messages if we exceed limit
+	if len(gb.chatLog) > gb.maxChatLog {
+		gb.chatLog = gb.chatLog[len(gb.chatLog)-gb.maxChatLog:]
+	}
 
-	shouldRespond := isMentioned || len(gb.chatLog) >= gb.maxChatLog
-	if shouldRespond {
-		gb.respondToChat(isMentioned)
+	isMentioned := gb.isMentioned(content)
+	log.Printf("[%s] %s (chat log: %d, mentioned: %v)", username, content, len(gb.chatLog), isMentioned)
+
+	// if mentioned, respond immediately
+	if isMentioned {
+		log.Printf("Bot mentioned - responding immediately")
+		// stop any pending debounce timer since we're responding now
+		if gb.debounceTimer != nil {
+			gb.debounceTimer.Stop()
+		}
+		gb.respondToChat(true)
+	} else {
+		// not mentioned - reset debounce timer to wait for more messages
+		log.Printf("Message added - resetting debounce timer (%v)", debounceInterval)
+		gb.resetDebounceTimer()
 	}
 }
 
@@ -245,7 +293,7 @@ func (gb *GraceBot) buildSystemPrompt(forcedResponse bool) string {
 	if forcedResponse {
 		prompt += "\n\nYou were directly mentioned in the latest message. You MUST respond."
 	} else {
-		prompt += "\n\nThe chat log is full. Respond if the conversation is interesting or relevant to you. If you don't want to respond, output '[SILENCE]'."
+		prompt += "\n\nHere are recent chat messages. Respond if the conversation is interesting or relevant to you. If you don't want to respond, output '[SILENCE]'."
 	}
 
 	prompt += "\n\nFor multi-line responses, use newlines to separate sentences. Keep each line under 255 characters."
