@@ -7,26 +7,26 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/conneroisu/groq-go/pkg/tools"
+	openrouter "github.com/revrost/go-openrouter"
 )
 
 const weatherAPIURL = "https://wttr.in/%s?format=j1"
 
-func getWeatherTool() tools.Tool {
-	return tools.Tool{
-		Type: tools.ToolTypeFunction,
-		Function: tools.FunctionDefinition{
+func getWeatherTool() openrouter.Tool {
+	return openrouter.Tool{
+		Type: openrouter.ToolTypeFunction,
+		Function: &openrouter.FunctionDefinition{
 			Name:        "get_weather",
 			Description: "Get current weather conditions for a specified location. Use this when users ask about weather, temperature, or conditions in a city.",
-			Parameters: tools.FunctionParameters{
-				Type: "object",
-				Properties: map[string]tools.PropertyDefinition{
-					"location": {
-						Type:        "string",
-						Description: "The city or location name (e.g., 'London', 'New York', 'Tokyo')",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"location": map[string]interface{}{
+						"type":        "string",
+						"description": "The city or location name (e.g., 'London', 'New York', 'Tokyo')",
 					},
 				},
-				Required: []string{"location"},
+				"required": []string{"location"},
 			},
 		},
 	}

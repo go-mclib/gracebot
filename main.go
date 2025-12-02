@@ -8,17 +8,17 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/conneroisu/groq-go"
+	openrouter "github.com/revrost/go-openrouter"
 	"github.com/go-mclib/client/client"
 )
 
 func main() {
 	cfg := LoadConfig()
-	if cfg.GroqAPIKey == "" {
-		log.Fatal("GROQ_API_KEY environment variable is not set")
+	if cfg.OpenRouterAPIKey == "" {
+		log.Fatal("OPENROUTER_API_KEY environment variable is not set")
 	}
 	if cfg.SystemPrompt == "" {
-		log.Fatal("GROQ_SYSTEM_PROMPT or GROQ_SYSTEM_PROMPT_FILE must be set")
+		log.Fatal("SYSTEM_PROMPT or SYSTEM_PROMPT_FILE must be set")
 	}
 
 	var (
@@ -40,10 +40,7 @@ func main() {
 	flag.BoolVar(&treatTransferAsDisconnect, "d", false, "treat server transfer as disconnect")
 	flag.Parse()
 
-	groqClient, err := groq.NewClient(cfg.GroqAPIKey)
-	if err != nil {
-		log.Fatalf("Failed to initialize Groq client: %v", err)
-	}
+	openrouterClient := openrouter.NewClient(cfg.OpenRouterAPIKey)
 
 	mcClient := client.NewClient(addr, username, verbose, online, hasGravity, cfg.AzureClientID)
 	mcClient.MaxReconnectAttempts = -1
@@ -51,7 +48,7 @@ func main() {
 	mcClient.TreatTransferAsDisconnect = treatTransferAsDisconnect
 	mcClient.RegisterDefaultHandlers()
 
-	chatter := NewGraceBot(groqClient, cfg.SystemPrompt, mcClient.Username, cfg.BotAliases, cfg.MaxChatLog)
+	chatter := NewGraceBot(openrouterClient, cfg.SystemPrompt, mcClient.Username, cfg.BotAliases, cfg.MaxChatLog)
 	chatter.SetClient(mcClient)
 	registerChatHandler(mcClient, chatter)
 

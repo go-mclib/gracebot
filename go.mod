@@ -3,17 +3,16 @@ module github.com/go-mclib/gracebot
 go 1.25.0
 
 require (
-	github.com/conneroisu/groq-go v0.9.5
 	github.com/go-mclib/client v0.0.0-20251201085320-f840a7727e74
 	github.com/go-mclib/data v0.0.0-20251201083958-168bf53dd3c3
 	github.com/go-mclib/protocol v0.0.0-20251201083925-8d7afa267830
+	github.com/revrost/go-openrouter v1.1.4
 )
 
 require (
 	github.com/Tnze/go-mc v1.20.2 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
-	github.com/buger/jsonparser v1.1.1 // indirect
 	github.com/charmbracelet/bubbles v0.21.0 // indirect
 	github.com/charmbracelet/bubbletea v1.3.10 // indirect
 	github.com/charmbracelet/colorprofile v0.3.3 // indirect

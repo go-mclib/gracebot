@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/conneroisu/groq-go"
+	openrouter "github.com/revrost/go-openrouter"
 	"github.com/go-mclib/client/client"
 )
 
@@ -27,30 +27,30 @@ type ChatMessage struct {
 }
 
 type GraceBot struct {
-	groqClient   *groq.Client
-	systemPrompt string
-	botUsername  string
-	botAliases   []string
-	maxChatLog   int
-	mcClient     *client.Client
-	mu           sync.Mutex
+	openrouterClient *openrouter.Client
+	systemPrompt     string
+	botUsername      string
+	botAliases       []string
+	maxChatLog       int
+	mcClient         *client.Client
+	mu               sync.Mutex
 
 	chatLog       []ChatMessage
-	context       []groq.ChatCompletionMessage
+	context       []openrouter.ChatCompletionMessage
 	debounceTimer *time.Timer
 	stopCh        chan struct{}
 }
 
-func NewGraceBot(groqClient *groq.Client, systemPrompt, botUsername string, botAliases []string, maxChatLog int) *GraceBot {
+func NewGraceBot(openrouterClient *openrouter.Client, systemPrompt, botUsername string, botAliases []string, maxChatLog int) *GraceBot {
 	gb := &GraceBot{
-		groqClient:   groqClient,
-		systemPrompt: systemPrompt,
-		botUsername:  botUsername,
-		botAliases:   botAliases,
-		maxChatLog:   maxChatLog,
-		chatLog:      make([]ChatMessage, 0, maxChatLog),
-		context:      make([]groq.ChatCompletionMessage, 0),
-		stopCh:       make(chan struct{}),
+		openrouterClient: openrouterClient,
+		systemPrompt:     systemPrompt,
+		botUsername:      botUsername,
+		botAliases:       botAliases,
+		maxChatLog:       maxChatLog,
+		chatLog:          make([]ChatMessage, 0, maxChatLog),
+		context:          make([]openrouter.ChatCompletionMessage, 0),
+		stopCh:           make(chan struct{}),
 	}
 
 	return gb
@@ -72,11 +72,11 @@ func (gb *GraceBot) Stop() {
 }
 
 // callChatCompletion is a generalized method for making chat completion requests
-func (gb *GraceBot) callChatCompletion(ctx context.Context, messages []groq.ChatCompletionMessage) (*groq.ChatCompletionResponse, error) {
+func (gb *GraceBot) callChatCompletion(ctx context.Context, messages []openrouter.ChatCompletionMessage) (*openrouter.ChatCompletionResponse, error) {
 	tools := GetAllTools()
 
-	response, err := gb.groqClient.ChatCompletion(ctx, groq.ChatCompletionRequest{
-		Model:             "llama-3.3-70b-versatile",
+	response, err := gb.openrouterClient.CreateChatCompletion(ctx, openrouter.ChatCompletionRequest{
+		Model:             "meta-llama/llama-3.3-70b-instruct:free",
 		Messages:          messages,
 		Temperature:       0.5,
 		MaxTokens:         512,
@@ -180,7 +180,7 @@ func (gb *GraceBot) respondToChat(forcedResponse bool) {
 
 	response, err := gb.callChatCompletion(ctx, messages)
 	if err != nil {
-		log.Printf("Groq API error: %v", err)
+		log.Printf("OpenRouter API error: %v", err)
 		// on error, clear chat log anyway to avoid getting stuck
 		gb.clearChatLog()
 		return
@@ -201,7 +201,7 @@ func (gb *GraceBot) respondToChat(forcedResponse bool) {
 		return
 	}
 
-	aiResponse := strings.TrimSpace(choice.Message.Content)
+	aiResponse := strings.TrimSpace(choice.Message.Content.Text)
 
 	// if LLM decided not to respond (empty or special token), just clear log
 	if aiResponse == "" || slices.Contains(silenceMarkers, aiResponse) {
@@ -218,7 +218,7 @@ func (gb *GraceBot) respondToChat(forcedResponse bool) {
 }
 
 // handleToolCalls executes tool calls and gets final response from LLM
-func (gb *GraceBot) handleToolCalls(ctx context.Context, messages []groq.ChatCompletionMessage, assistantMessage groq.ChatCompletionMessage) {
+func (gb *GraceBot) handleToolCalls(ctx context.Context, messages []openrouter.ChatCompletionMessage, assistantMessage openrouter.ChatCompletionMessage) {
 	messages = append(messages, assistantMessage)
 
 	// exec
@@ -234,9 +234,9 @@ func (gb *GraceBot) handleToolCalls(ctx context.Context, messages []groq.ChatCom
 		}
 
 		// add tool result to messages
-		messages = append(messages, groq.ChatCompletionMessage{
-			Role:       groq.RoleTool,
-			Content:    result,
+		messages = append(messages, openrouter.ChatCompletionMessage{
+			Role:       openrouter.ChatMessageRoleTool,
+			Content:    openrouter.Content{Text: result},
 			ToolCallID: toolCall.ID,
 		})
 	}
@@ -244,7 +244,7 @@ func (gb *GraceBot) handleToolCalls(ctx context.Context, messages []groq.ChatCom
 	// get final response from LLM with tool results
 	response, err := gb.callChatCompletion(ctx, messages)
 	if err != nil {
-		log.Printf("Groq API error after tool call: %v", err)
+		log.Printf("OpenRouter API error after tool call: %v", err)
 		gb.clearChatLog()
 		return
 	}
@@ -255,7 +255,7 @@ func (gb *GraceBot) handleToolCalls(ctx context.Context, messages []groq.ChatCom
 		return
 	}
 
-	aiResponse := strings.TrimSpace(response.Choices[0].Message.Content)
+	aiResponse := strings.TrimSpace(response.Choices[0].Message.Content.Text)
 
 	// if LLM decided not to respond, just clear log
 	if aiResponse == "" || slices.Contains(silenceMarkers, aiResponse) {
@@ -271,21 +271,21 @@ func (gb *GraceBot) handleToolCalls(ctx context.Context, messages []groq.ChatCom
 	gb.mu.Lock()
 }
 
-// buildAPIMessages builds the messages array for the Groq API
-func (gb *GraceBot) buildAPIMessages(forcedResponse bool) []groq.ChatCompletionMessage {
-	messages := []groq.ChatCompletionMessage{
+// buildAPIMessages builds the messages array for the OpenRouter API
+func (gb *GraceBot) buildAPIMessages(forcedResponse bool) []openrouter.ChatCompletionMessage {
+	messages := []openrouter.ChatCompletionMessage{
 		{
-			Role:    groq.RoleSystem,
-			Content: gb.buildSystemPrompt(forcedResponse),
+			Role:    openrouter.ChatMessageRoleSystem,
+			Content: openrouter.Content{Text: gb.buildSystemPrompt(forcedResponse)},
 		},
 	}
 
 	messages = append(messages, gb.context...)
 
 	chatLogText := gb.formatChatLog()
-	messages = append(messages, groq.ChatCompletionMessage{
-		Role:    groq.RoleUser,
-		Content: chatLogText,
+	messages = append(messages, openrouter.ChatCompletionMessage{
+		Role:    openrouter.ChatMessageRoleUser,
+		Content: openrouter.Content{Text: chatLogText},
 	})
 
 	return messages
@@ -316,9 +316,9 @@ func (gb *GraceBot) formatChatLog() string {
 
 func (gb *GraceBot) addChatLogToContext() {
 	chatLogText := gb.formatChatLog()
-	gb.context = append(gb.context, groq.ChatCompletionMessage{
-		Role:    groq.RoleUser,
-		Content: chatLogText,
+	gb.context = append(gb.context, openrouter.ChatCompletionMessage{
+		Role:    openrouter.ChatMessageRoleUser,
+		Content: openrouter.Content{Text: chatLogText},
 	})
 
 	// keep context limited to last 20 messages (10 exchanges)
@@ -362,9 +362,9 @@ func (gb *GraceBot) SendResponseToMinecraft(aiResponse string) {
 			continue
 		}
 
-		gb.context = append(gb.context, groq.ChatCompletionMessage{
-			Role:    groq.RoleAssistant,
-			Content: line,
+		gb.context = append(gb.context, openrouter.ChatCompletionMessage{
+			Role:    openrouter.ChatMessageRoleAssistant,
+			Content: openrouter.Content{Text: line},
 		})
 
 		log.Printf("Bot responded (line %d/%d): %s", i+1, len(validLines), line)

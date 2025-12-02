@@ -3,13 +3,13 @@ package main
 import (
 	"fmt"
 
-	"github.com/conneroisu/groq-go/pkg/tools"
+	openrouter "github.com/revrost/go-openrouter"
 	"github.com/go-mclib/client/client"
 )
 
 // GetAllTools returns all available tools
-func GetAllTools() []tools.Tool {
-	return []tools.Tool{
+func GetAllTools() []openrouter.Tool {
+	return []openrouter.Tool{
 		getWeatherTool(),
 		getCommandTool(),
 	}

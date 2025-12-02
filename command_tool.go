@@ -4,25 +4,25 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/conneroisu/groq-go/pkg/tools"
+	openrouter "github.com/revrost/go-openrouter"
 	"github.com/go-mclib/client/client"
 )
 
-func getCommandTool() tools.Tool {
-	return tools.Tool{
-		Type: tools.ToolTypeFunction,
-		Function: tools.FunctionDefinition{
+func getCommandTool() openrouter.Tool {
+	return openrouter.Tool{
+		Type: openrouter.ToolTypeFunction,
+		Function: &openrouter.FunctionDefinition{
 			Name:        "send_command",
 			Description: "Execute a Minecraft command as the bot. Use this to perform server commands like teleporting, giving items, changing game rules, etc. The command should not include the leading '/' character.",
-			Parameters: tools.FunctionParameters{
-				Type: "object",
-				Properties: map[string]tools.PropertyDefinition{
-					"command": {
-						Type:        "string",
-						Description: "The Minecraft command to execute (without the leading '/'). Examples: 'tp @s ~ ~10 ~', 'gamemode creative', 'time set day'",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"command": map[string]interface{}{
+						"type":        "string",
+						"description": "The Minecraft command to execute (without the leading '/'). Examples: 'tp @s ~ ~10 ~', 'gamemode creative', 'time set day'",
 					},
 				},
-				Required: []string{"command"},
+				"required": []string{"command"},
 			},
 		},
 	}
