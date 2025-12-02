@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	openrouter "github.com/revrost/go-openrouter"
 	"github.com/go-mclib/client/client"
+	openrouter "github.com/revrost/go-openrouter"
 )
 
 const (
@@ -82,6 +82,7 @@ func (gb *GraceBot) callChatCompletion(ctx context.Context, messages []openroute
 		MaxTokens:         512,
 		Tools:             tools,
 		ToolChoice:        "auto",
+		Stream:            false,
 		ParallelToolCalls: true,
 	})
 
