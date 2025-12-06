@@ -35,9 +35,9 @@ const (
 	geminiModel = "gemini-flash-lite-latest"
 
 	// Typing simulation for human-like responses
-	msPerCharacter    = 50  // Milliseconds per character (simulates ~20 chars/second typing speed)
-	minMessageDelay   = 500 // Minimum delay between messages (ms)
-	maxMessageDelay   = 3000 // Maximum delay between messages (ms)
+	msPerCharacter    = 150  // Milliseconds per character (simulates ~20 chars/second typing speed)
+	minMessageDelay   = 1500 // Minimum delay between messages (ms)
+	maxMessageDelay   = 5000 // Maximum delay between messages (ms)
 )
 
 // ChatMessage represents a chat message
