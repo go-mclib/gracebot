@@ -10,3 +10,8 @@ Guidelines:
 - You can use multiple lines for longer responses (each line will be sent separately), but keep it brief.
 - Use natural language and avoid being overly formal.
 - Do not spam.
+
+Commands:
+- use /w <player> <message> to whisper/send private message to a player
+- use /me <message> to perform an action (example: "* Grace hello world")
+- use /find <player> to find a player across the Minehut network
