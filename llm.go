@@ -5,12 +5,13 @@ import (
 	_ "embed"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-mclib/client/client"
-	"google.golang.org/genai"
+	"github.com/sashabaranov/go-openai"
 )
 
 var (
@@ -32,7 +33,8 @@ const (
 	// Word that indicates bot doesn't want to reply
 	stopWord = "[silence]"
 
-	geminiModel = "gemini-flash-lite-latest"
+	groqModel   = "llama-3.3-70b-versatile"
+	groqBaseURL = "https://api.groq.com/openai/v1"
 
 	// Typing simulation for human-like responses
 	msPerCharacter    = 150  // Milliseconds per character (simulates ~20 chars/second typing speed)
@@ -49,10 +51,10 @@ type ChatMessage struct {
 
 // LLMManager manages the LLM interactions
 type LLMManager struct {
-	client              *genai.Client
+	client              *openai.Client
 	chatBuffer          []ChatMessage
-	lastProcessedIndex  int // Index of last processed message
-	conversationHistory []*genai.Content // Persistent conversation history
+	lastProcessedIndex  int                          // Index of last processed message
+	conversationHistory []openai.ChatCompletionMessage // Persistent conversation history
 	bufferMutex         sync.Mutex
 	mcClient            *client.Client
 	ctx                 context.Context
@@ -65,20 +67,23 @@ type LLMManager struct {
 func NewLLMManager(mcClient *client.Client) (*LLMManager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Create Gemini client (reads GEMINI_API_KEY from environment)
-	genaiClient, err := genai.NewClient(ctx, &genai.ClientConfig{
-		Backend: genai.BackendGeminiAPI,
-	})
-	if err != nil {
+	// Get API key from environment
+	apiKey := os.Getenv("GROQ_API_KEY")
+	if apiKey == "" {
 		cancel()
-		return nil, fmt.Errorf("failed to create Gemini client: %w", err)
+		return nil, fmt.Errorf("GROQ_API_KEY environment variable not set")
 	}
 
+	// Create Groq client using OpenAI-compatible API
+	config := openai.DefaultConfig(apiKey)
+	config.BaseURL = groqBaseURL
+	groqClient := openai.NewClientWithConfig(config)
+
 	manager := &LLMManager{
-		client:              genaiClient,
+		client:              groqClient,
 		chatBuffer:          make([]ChatMessage, 0, maxChatBuffer),
 		lastProcessedIndex:  0,
-		conversationHistory: make([]*genai.Content, 0),
+		conversationHistory: make([]openai.ChatCompletionMessage, 0),
 		mcClient:            mcClient,
 		ctx:                 ctx,
 		cancel:              cancel,
@@ -90,7 +95,7 @@ func NewLLMManager(mcClient *client.Client) (*LLMManager, error) {
 	})
 	manager.debounceTimer.Stop()
 
-	log.Printf("[LLM] Manager initialized with model: %s", geminiModel)
+	log.Printf("[LLM] Manager initialized with model: %s", groqModel)
 	return manager, nil
 }
 
@@ -175,123 +180,108 @@ func (m *LLMManager) processChat() {
 
 	log.Printf("[LLM] Processing %d new messages...", len(messagesToProcess))
 
-	// Create the request
+	// Build messages: system prompt + existing conversation history + new messages
 	systemInstruction := systemPrompt + "\n\n" + personality
-	config := &genai.GenerateContentConfig{
-		SystemInstruction: &genai.Content{
-			Parts: []*genai.Part{{Text: systemInstruction}},
-		},
-		Tools:           defineLLMTools(),
-		MaxOutputTokens: 300,
-		Temperature:     genai.Ptr(float32(0.9)),
-	}
 
-	// Build contents: existing conversation history + new messages
 	m.bufferMutex.Lock()
-	contents := make([]*genai.Content, len(m.conversationHistory))
-	copy(contents, m.conversationHistory)
-	m.bufferMutex.Unlock()
+	messages := make([]openai.ChatCompletionMessage, 0, len(m.conversationHistory)+2)
 
-	// Add new messages
-	contents = append(contents, &genai.Content{
-		Role: genai.RoleUser,
-		Parts: []*genai.Part{
-			{Text: newMessagesText.String()},
-		},
+	// Add system message
+	messages = append(messages, openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleSystem,
+		Content: systemInstruction,
 	})
 
+	// Add conversation history
+	messages = append(messages, m.conversationHistory...)
+	m.bufferMutex.Unlock()
+
+	// Add new user messages
+	messages = append(messages, openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: newMessagesText.String(),
+	})
+
+	// Create the request
+	req := openai.ChatCompletionRequest{
+		Model:       groqModel,
+		Messages:    messages,
+		Tools:       defineLLMTools(),
+		MaxTokens:   300,
+		Temperature: 0.9,
+	}
+
 	// Send the conversation with context
-	resp, err := m.client.Models.GenerateContent(m.ctx, geminiModel, contents, config)
+	resp, err := m.client.CreateChatCompletion(m.ctx, req)
 	if err != nil {
 		log.Printf("[LLM] Error: %v", err)
 		return
 	}
 
 	// Process the response and update conversation history
-	m.handleResponse(resp, contents, config)
+	m.handleResponse(resp, messages)
 }
 
 // handleResponse processes the LLM response and handles tool calls
-func (m *LLMManager) handleResponse(resp *genai.GenerateContentResponse, history []*genai.Content, config *genai.GenerateContentConfig) {
-	if resp == nil || len(resp.Candidates) == 0 {
-		log.Printf("[LLM] No response candidates")
+func (m *LLMManager) handleResponse(resp openai.ChatCompletionResponse, history []openai.ChatCompletionMessage) {
+	if len(resp.Choices) == 0 {
+		log.Printf("[LLM] No response choices")
 		return
 	}
 
-	candidate := resp.Candidates[0]
-	if candidate.Content == nil {
-		log.Printf("[LLM] No content in response")
-		return
-	}
+	choice := resp.Choices[0]
+	assistantMessage := choice.Message
 
 	// Add assistant's response to history
-	history = append(history, candidate.Content)
+	history = append(history, assistantMessage)
 
-	// Check for tool calls and text responses
-	var toolCalls []*genai.FunctionCall
-	var textResponse string
-
-	for _, part := range candidate.Content.Parts {
-		if part.FunctionCall != nil {
-			toolCalls = append(toolCalls, part.FunctionCall)
-		}
-		if part.Text != "" {
-			textResponse += part.Text
-		}
-	}
-
-	// Handle tool calls first
-	if len(toolCalls) > 0 {
+	// Check for tool calls
+	if len(assistantMessage.ToolCalls) > 0 {
 		// Execute tools and collect responses
-		functionResponses := make([]*genai.Part, 0, len(toolCalls))
-
-		for _, funcCall := range toolCalls {
-			log.Printf("[LLM] Tool call: %s", funcCall.Name)
+		for _, toolCall := range assistantMessage.ToolCalls {
+			log.Printf("[LLM] Tool call: %s", toolCall.Function.Name)
 
 			// Execute the tool
-			result := executeTool(m.mcClient, funcCall)
+			result := executeTool(m.mcClient, toolCall)
 
-			// Create function response
-			functionResponses = append(functionResponses, &genai.Part{
-				FunctionResponse: &genai.FunctionResponse{
-					Name: funcCall.Name,
-					Response: map[string]any{
-						"result": result,
-					},
-				},
+			// Add tool response to history
+			history = append(history, openai.ChatCompletionMessage{
+				Role:       openai.ChatMessageRoleTool,
+				Content:    result,
+				ToolCallID: toolCall.ID,
 			})
 		}
 
-		// Add function responses to history
-		history = append(history, &genai.Content{
-			Role:  genai.RoleUser,
-			Parts: functionResponses,
-		})
-
 		// Send tool results back to continue the conversation
-		toolResp, err := m.client.Models.GenerateContent(m.ctx, geminiModel, history, config)
+		req := openai.ChatCompletionRequest{
+			Model:       groqModel,
+			Messages:    history,
+			Tools:       defineLLMTools(),
+			MaxTokens:   300,
+			Temperature: 0.9,
+		}
+
+		toolResp, err := m.client.CreateChatCompletion(m.ctx, req)
 		if err != nil {
 			log.Printf("[LLM] Error sending tool response: %v", err)
 			return
 		}
 
 		// Process the follow-up response
-		m.handleResponse(toolResp, history, config)
+		m.handleResponse(toolResp, history)
 		return
 	}
 
 	// Handle text response
-	if textResponse != "" {
-		response := strings.TrimSpace(textResponse)
+	if assistantMessage.Content != "" {
+		response := strings.TrimSpace(assistantMessage.Content)
 		log.Printf("[LLM] Response: %s", response)
 
 		// Check if the bot wants to stay silent
 		if strings.Contains(response, stopWord) {
 			log.Printf("[LLM] Bot chose to remain silent")
 			// Still update conversation history even when silent
-			m.bufferMutex.Lock()
-			m.conversationHistory = history
-			m.bufferMutex.Unlock()
+			m.updateConversationHistory(history)
 			return
 		}
 
@@ -299,9 +289,18 @@ func (m *LLMManager) handleResponse(resp *genai.GenerateContentResponse, history
 		m.sendChatResponse(response)
 
 		// Update conversation history with successful interaction
-		m.bufferMutex.Lock()
-		m.conversationHistory = history
-		m.bufferMutex.Unlock()
+		m.updateConversationHistory(history)
+	}
+}
+
+// updateConversationHistory updates the conversation history (excluding system message)
+func (m *LLMManager) updateConversationHistory(history []openai.ChatCompletionMessage) {
+	m.bufferMutex.Lock()
+	defer m.bufferMutex.Unlock()
+
+	// Skip the system message (first message) when storing history
+	if len(history) > 1 {
+		m.conversationHistory = history[1:]
 	}
 }
 

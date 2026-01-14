@@ -1,31 +1,31 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 
 	"github.com/go-mclib/client/client"
-	"google.golang.org/genai"
+	"github.com/sashabaranov/go-openai"
 )
 
-// defineLLMTools returns the tool declarations for Gemini API
-func defineLLMTools() []*genai.Tool {
-	return []*genai.Tool{
+// defineLLMTools returns the tool declarations for OpenAI-compatible API (Groq)
+func defineLLMTools() []openai.Tool {
+	return []openai.Tool{
 		{
-			FunctionDeclarations: []*genai.FunctionDeclaration{
-				{
-					Name:        "run_command",
-					Description: "Execute a Minecraft command on the server. Commands should be sent without the leading slash. For example, to get help, use 'help' not '/help'.",
-					Parameters: &genai.Schema{
-						Type: genai.TypeObject,
-						Properties: map[string]*genai.Schema{
-							"command": {
-								Type:        genai.TypeString,
-								Description: "The command to execute (without leading slash)",
-							},
+			Type: openai.ToolTypeFunction,
+			Function: &openai.FunctionDefinition{
+				Name:        "run_command",
+				Description: "Execute a Minecraft command on the server. Commands should be sent without the leading slash. For example, to get help, use 'help' not '/help'.",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"command": map[string]any{
+							"type":        "string",
+							"description": "The command to execute (without leading slash)",
 						},
-						Required: []string{"command"},
 					},
+					"required": []string{"command"},
 				},
 			},
 		},
@@ -33,21 +33,24 @@ func defineLLMTools() []*genai.Tool {
 }
 
 // executeTool handles tool execution and returns the result
-func executeTool(c *client.Client, toolCall *genai.FunctionCall) string {
-	switch toolCall.Name {
+func executeTool(c *client.Client, toolCall openai.ToolCall) string {
+	switch toolCall.Function.Name {
 	case "run_command":
-		command, ok := toolCall.Args["command"].(string)
-		if !ok {
-			return "Error: command parameter must be a string"
+		// Parse the JSON arguments
+		var args struct {
+			Command string `json:"command"`
+		}
+		if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args); err != nil {
+			return fmt.Sprintf("Error parsing arguments: %v", err)
 		}
 
-		log.Printf("[Tool] Executing command: /%s", command)
-		if err := c.SendCommand(command); err != nil {
+		log.Printf("[Tool] Executing command: /%s", args.Command)
+		if err := c.SendCommand(args.Command); err != nil {
 			return fmt.Sprintf("Error executing command: %v", err)
 		}
-		return fmt.Sprintf("Command '/%s' executed successfully", command)
+		return fmt.Sprintf("Command '/%s' executed successfully", args.Command)
 
 	default:
-		return fmt.Sprintf("Unknown tool: %s", toolCall.Name)
+		return fmt.Sprintf("Unknown tool: %s", toolCall.Function.Name)
 	}
 }
