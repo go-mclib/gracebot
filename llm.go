@@ -37,10 +37,18 @@ const (
 	groqBaseURL = "https://api.groq.com/openai/v1"
 
 	// Typing simulation for human-like responses
-	msPerCharacter    = 150  // Milliseconds per character (simulates ~20 chars/second typing speed)
-	minMessageDelay   = 1500 // Minimum delay between messages (ms)
-	maxMessageDelay   = 5000 // Maximum delay between messages (ms)
+	msPerCharacter  = 150  // Milliseconds per character (simulates ~20 chars/second typing speed)
+	minMessageDelay = 1500 // Minimum delay between messages (ms)
+	maxMessageDelay = 5000 // Maximum delay between messages (ms)
 )
+
+// System message patterns that should be buffered but not trigger LLM processing
+// These are added to context but don't reset the debounce timer
+var bufferOnlyPatterns = []string{
+	"multiplayer.player.left",
+	"multiplayer.player.join",
+	"death.",
+}
 
 // ChatMessage represents a chat message
 type ChatMessage struct {
@@ -53,7 +61,7 @@ type ChatMessage struct {
 type LLMManager struct {
 	client              *openai.Client
 	chatBuffer          []ChatMessage
-	lastProcessedIndex  int                          // Index of last processed message
+	lastProcessedIndex  int                            // Index of last processed message
 	conversationHistory []openai.ChatCompletionMessage // Persistent conversation history
 	bufferMutex         sync.Mutex
 	mcClient            *client.Client
@@ -99,8 +107,21 @@ func NewLLMManager(mcClient *client.Client) (*LLMManager, error) {
 	return manager, nil
 }
 
+// isBufferOnlyMessage checks if a message should be buffered but not trigger processing
+func isBufferOnlyMessage(message string) bool {
+	for _, pattern := range bufferOnlyPatterns {
+		if strings.Contains(message, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
 // AddMessage adds a message to the chat buffer
 func (m *LLMManager) AddMessage(sender, message string, isSystem bool) {
+	// Check if this is a buffer-only message (join/leave/death)
+	bufferOnly := isBufferOnlyMessage(message)
+
 	m.bufferMutex.Lock()
 
 	// Add the new message
@@ -121,13 +142,15 @@ func (m *LLMManager) AddMessage(sender, message string, isSystem bool) {
 		}
 	}
 
-	log.Printf("[LLM] Buffer: %d/%d messages (last processed: %d)", len(m.chatBuffer), maxChatBuffer, m.lastProcessedIndex)
+	log.Printf("[LLM] Buffer: %d/%d messages (last processed: %d, buffer-only: %v)", len(m.chatBuffer), maxChatBuffer, m.lastProcessedIndex, bufferOnly)
 	m.bufferMutex.Unlock()
 
-	// Reset debounce timer
-	m.timerMutex.Lock()
-	m.debounceTimer.Reset(chatProcessInterval)
-	m.timerMutex.Unlock()
+	// Only reset debounce timer for regular messages (not join/leave/death)
+	if !bufferOnly {
+		m.timerMutex.Lock()
+		m.debounceTimer.Reset(chatProcessInterval)
+		m.timerMutex.Unlock()
+	}
 }
 
 // startChatProcessor is no longer needed - we use debounce timer now
