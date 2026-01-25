@@ -7,6 +7,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,9 +18,8 @@ import (
 
 const (
 	defaultWordLength = 5
-	maxWordLength     = 10
+	maxWordLength     = 15
 	minWordLength     = 3
-	maxGuesses        = 6
 )
 
 // WordleGame represents an active wordle game
@@ -28,9 +28,10 @@ type WordleGame struct {
 	Length     int
 	Guesses    []string
 	Revealed   []bool // Which letters have been revealed
-	MaxGuesses int
+	MaxGuesses int    // 0 = infinite
 	StartedBy  string
 	StartTime  time.Time
+	CustomWord bool // True if word was provided by user
 }
 
 // WordleManager manages wordle games
@@ -49,8 +50,8 @@ func InitWordle(c *client.Client) {
 		mcClient: c,
 	}
 
-	// Register wordle commands (everyone can use)
-	RegisterCommand("wordle", "Start a word guessing game", "!wordle [length] (default: 5)", []string{"admin"}, wordleCommand)
+	// Register wordle commands
+	RegisterCommand("wordle", "Start a word guessing game", "!wordle [word|length] [attempts]", []string{"admin"}, wordleCommand)
 	RegisterCommand("wordlepoints", "Show wordle points", "!wordlepoints [player]", nil, wordlePointsCommand)
 }
 
@@ -73,37 +74,90 @@ func wordlePointsCommand(c *client.Client, sender string, args []string) {
 	c.SendChatMessage(fmt.Sprintf("Top: %s: %d", topPlayer, topPoints))
 }
 
+// isNumeric checks if a string is a number
+func isNumeric(s string) bool {
+	_, err := strconv.Atoi(s)
+	return err == nil
+}
+
+// isValidWord checks if a string contains only letters
+func isValidWord(s string) bool {
+	for _, r := range s {
+		if !unicode.IsLetter(r) {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
 // wordleCommand handles the !wordle command
+// Usage: !wordle [word|length] [attempts]
+// - !wordle -> random 5-letter word, infinite attempts
+// - !wordle 7 -> random 7-letter word, infinite attempts
+// - !wordle hello -> use "hello" as word, infinite attempts
+// - !wordle hello 6 -> use "hello" as word, 6 attempts
+// - !wordle 5 6 -> random 5-letter word, 6 attempts
 func wordleCommand(c *client.Client, sender string, args []string) {
 	wordleManager.mu.Lock()
 	defer wordleManager.mu.Unlock()
 
 	if wordleManager.activeGame != nil {
-		c.SendChatMessage(fmt.Sprintf("Game in progress (%d/%d guesses): %s",
-			len(wordleManager.activeGame.Guesses), wordleManager.activeGame.MaxGuesses,
-			wordleManager.activeGame.GetProgressDisplay()))
+		guessInfo := fmt.Sprintf("%d", len(wordleManager.activeGame.Guesses))
+		if wordleManager.activeGame.MaxGuesses > 0 {
+			guessInfo = fmt.Sprintf("%d/%d", len(wordleManager.activeGame.Guesses), wordleManager.activeGame.MaxGuesses)
+		}
+		c.SendChatMessage(fmt.Sprintf("Game in progress (%s guesses): %s",
+			guessInfo, wordleManager.activeGame.GetProgressDisplay()))
 		return
 	}
 
-	// Parse length argument
-	length := defaultWordLength
-	if len(args) > 0 {
-		var parsedLength int
-		if _, err := fmt.Sscanf(args[0], "%d", &parsedLength); err == nil {
-			if parsedLength >= minWordLength && parsedLength <= maxWordLength {
-				length = parsedLength
-			} else {
-				c.SendChatMessage(fmt.Sprintf("Word length must be between %d and %d", minWordLength, maxWordLength))
-				return
-			}
+	var word string
+	var maxAttempts int = 0 // 0 = infinite
+	var customWord bool = false
+
+	if len(args) == 0 {
+		// No args: random 5-letter word, infinite attempts
+		var err error
+		word, err = fetchRandomWord(defaultWordLength)
+		if err != nil {
+			log.Printf("[Wordle] Failed to fetch word: %v", err)
+			c.SendChatMessage("Failed to start game. Please try again.")
+			return
 		}
+	} else if isNumeric(args[0]) {
+		// First arg is a number: it's the length
+		length, _ := strconv.Atoi(args[0])
+		if length < minWordLength || length > maxWordLength {
+			c.SendChatMessage(fmt.Sprintf("Word length must be between %d and %d", minWordLength, maxWordLength))
+			return
+		}
+		var err error
+		word, err = fetchRandomWord(length)
+		if err != nil {
+			log.Printf("[Wordle] Failed to fetch word: %v", err)
+			c.SendChatMessage("Failed to start game. Please try again.")
+			return
+		}
+		// Check for second arg (attempts)
+		if len(args) > 1 && isNumeric(args[1]) {
+			maxAttempts, _ = strconv.Atoi(args[1])
+		}
+	} else if isValidWord(args[0]) {
+		// First arg is a word: use it as the custom word
+		word = args[0]
+		customWord = true
+		// Check for second arg (attempts)
+		if len(args) > 1 && isNumeric(args[1]) {
+			maxAttempts, _ = strconv.Atoi(args[1])
+		}
+	} else {
+		c.SendChatMessage("Usage: !wordle [word|length] [attempts]")
+		return
 	}
 
-	// Fetch a random word
-	word, err := fetchRandomWord(length)
-	if err != nil {
-		log.Printf("[Wordle] Failed to fetch word: %v", err)
-		c.SendChatMessage("Failed to start game. Please try again.")
+	length := len(word)
+	if length < minWordLength || length > maxWordLength {
+		c.SendChatMessage(fmt.Sprintf("Word must be between %d and %d letters", minWordLength, maxWordLength))
 		return
 	}
 
@@ -111,15 +165,21 @@ func wordleCommand(c *client.Client, sender string, args []string) {
 	wordleManager.activeGame = &WordleGame{
 		Word:       strings.ToUpper(word),
 		Length:     length,
-		Guesses:    make([]string, 0, maxGuesses),
+		Guesses:    make([]string, 0),
 		Revealed:   make([]bool, length),
-		MaxGuesses: maxGuesses,
+		MaxGuesses: maxAttempts,
 		StartedBy:  sender,
 		StartTime:  time.Now(),
+		CustomWord: customWord,
 	}
 
-	c.SendChatMessage(fmt.Sprintf("Wordle started by %s! Guess the %d-letter word (%d attempts): %s",
-		sender, length, maxGuesses, wordleManager.activeGame.GetProgressDisplay()))
+	attemptsStr := "infinite"
+	if maxAttempts > 0 {
+		attemptsStr = fmt.Sprintf("%d", maxAttempts)
+	}
+
+	c.SendChatMessage(fmt.Sprintf("Wordle started by %s! Guess the %d-letter word (%s attempts): %s",
+		sender, length, attemptsStr, wordleManager.activeGame.GetProgressDisplay()))
 }
 
 // StopWordle stops the current wordle game, returns true if a game was stopped
@@ -185,9 +245,14 @@ func ProcessGuess(c *client.Client, sender, message string) bool {
 
 	// Check for exact match
 	if guess == game.Word {
-		AddWordlePoint(sender)
-		points := GetWordlePoints(sender)
-		c.SendChatMessage(fmt.Sprintf("Correct! %s guessed %s in %d guesses! (Total: %d)", sender, game.Word, len(game.Guesses), points))
+		// Only award points for non-custom words
+		if !game.CustomWord {
+			AddWordlePoint(sender)
+			points := GetWordlePoints(sender)
+			c.SendChatMessage(fmt.Sprintf("Correct! %s guessed %s in %d guesses! (Total: %d)", sender, game.Word, len(game.Guesses), points))
+		} else {
+			c.SendChatMessage(fmt.Sprintf("Correct! %s guessed %s in %d guesses!", sender, game.Word, len(game.Guesses)))
+		}
 		wordleManager.activeGame = nil
 		return true
 	}
@@ -195,15 +260,19 @@ func ProcessGuess(c *client.Client, sender, message string) bool {
 	// Update revealed letters and build result
 	result := game.ProcessGuessAndReveal(guess)
 
-	// Check for game over
-	if len(game.Guesses) >= game.MaxGuesses {
+	// Check for game over (only if MaxGuesses > 0)
+	if game.MaxGuesses > 0 && len(game.Guesses) >= game.MaxGuesses {
 		c.SendChatMessage(fmt.Sprintf("%s: %s | Game over! The word was: %s", sender, result, game.Word))
 		wordleManager.activeGame = nil
 		return true
 	}
 
 	// Show progress
-	c.SendChatMessage(fmt.Sprintf("%s: %s (%d/%d) %s", sender, result, len(game.Guesses), game.MaxGuesses, game.GetProgressDisplay()))
+	guessInfo := fmt.Sprintf("%d", len(game.Guesses))
+	if game.MaxGuesses > 0 {
+		guessInfo = fmt.Sprintf("%d/%d", len(game.Guesses), game.MaxGuesses)
+	}
+	c.SendChatMessage(fmt.Sprintf("%s: %s (%s) %s", sender, result, guessInfo, game.GetProgressDisplay()))
 
 	return true
 }

@@ -1,15 +1,10 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/go-mclib/client/client"
 )
@@ -130,7 +125,6 @@ func RegisterDefaultCommands() {
 	RegisterCommand("help", "Shows available commands", "!help [command]", nil, helpCommand)
 	RegisterCommand("stop", "Stop any ongoing activity", "!stop", nil, stopCommand)
 	RegisterCommand("rank", "Check player ranks", "!rank [player]", nil, rankCommand)
-	RegisterCommand("define", "Define a word", "!define <word>", nil, defineCommand)
 
 	// Admin only
 	RegisterCommand("addrank", "Add rank to player", "!addrank <player> <rank>", []string{"admin"}, addRankCommand)
@@ -229,73 +223,4 @@ func delRankCommand(c *client.Client, sender string, args []string) {
 	}
 
 	c.SendChatMessage(fmt.Sprintf("Removed rank '%s' from %s", rank, player))
-}
-
-// dictionaryResponse represents the response from dictionary API
-type dictionaryResponse struct {
-	Word     string `json:"word"`
-	Meanings []struct {
-		PartOfSpeech string `json:"partOfSpeech"`
-		Definitions  []struct {
-			Definition string `json:"definition"`
-		} `json:"definitions"`
-	} `json:"meanings"`
-}
-
-// defineCommand looks up a word definition
-func defineCommand(c *client.Client, sender string, args []string) {
-	if len(args) == 0 {
-		c.SendChatMessage("Usage: !define <word>")
-		return
-	}
-
-	word := strings.ToLower(args[0])
-	apiURL := fmt.Sprintf("https://api.dictionaryapi.dev/api/v2/entries/en/%s", url.QueryEscape(word))
-
-	httpClient := &http.Client{Timeout: 5 * time.Second}
-	resp, err := httpClient.Get(apiURL)
-	if err != nil {
-		c.SendChatMessage("Failed to look up definition.")
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
-		c.SendChatMessage(fmt.Sprintf("No definition found for '%s'", word))
-		return
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		c.SendChatMessage("Failed to look up definition.")
-		return
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		c.SendChatMessage("Failed to read definition.")
-		return
-	}
-
-	var results []dictionaryResponse
-	if err := json.Unmarshal(body, &results); err != nil || len(results) == 0 {
-		c.SendChatMessage("Failed to parse definition.")
-		return
-	}
-
-	// Get first definition
-	result := results[0]
-	if len(result.Meanings) == 0 || len(result.Meanings[0].Definitions) == 0 {
-		c.SendChatMessage(fmt.Sprintf("No definition found for '%s'", word))
-		return
-	}
-
-	partOfSpeech := result.Meanings[0].PartOfSpeech
-	definition := result.Meanings[0].Definitions[0].Definition
-
-	// Truncate if too long
-	if len(definition) > 200 {
-		definition = definition[:197] + "..."
-	}
-
-	c.SendChatMessage(fmt.Sprintf("%s (%s): %s", word, partOfSpeech, definition))
 }

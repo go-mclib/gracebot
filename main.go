@@ -51,6 +51,7 @@ func main() {
 
 	// Initialize command framework (always available)
 	RegisterDefaultCommands()
+	InitLexicon()
 	InitWordle(mcClient)
 	InitSing(mcClient)
 	log.Println("Command mode initialized. Use !help to see available commands.")
