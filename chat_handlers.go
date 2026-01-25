@@ -10,10 +10,13 @@ import (
 )
 
 var llmManager *LLMManager
+var conversationEnabled bool
 
 // initChatHandlers initializes the chat handlers with the LLM manager
+// manager can be nil if conversation mode is disabled
 func initChatHandlers(manager *LLMManager) {
 	llmManager = manager
+	conversationEnabled = manager != nil
 }
 
 func graceChatHandler(c *client.Client, pkt *jp.Packet) {
@@ -28,7 +31,18 @@ func graceChatHandler(c *client.Client, pkt *jp.Packet) {
 
 			message := string(d.Message)
 			if sender != "" && message != "" {
-				if llmManager != nil {
+				// Mode 1: Command handling (always active, ! prefix)
+				if HandleCommand(c, sender, message) {
+					return
+				}
+
+				// Check for wordle guesses (if game is active)
+				if ProcessGuess(c, sender, message) {
+					return
+				}
+
+				// Mode 2: Conversation mode (if enabled)
+				if conversationEnabled && llmManager != nil {
 					llmManager.AddMessage(sender, message, false)
 				}
 			}
@@ -52,7 +66,8 @@ func graceChatHandler(c *client.Client, pkt *jp.Packet) {
 			}
 
 			if content != "" && !shouldFilterMessage(content) {
-				if llmManager != nil {
+				// Only forward system messages to LLM if conversation mode is enabled
+				if conversationEnabled && llmManager != nil {
 					llmManager.AddMessage("", content, true)
 				}
 			}

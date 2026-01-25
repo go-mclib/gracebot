@@ -45,12 +45,22 @@ func main() {
 	mcClient.TreatTransferAsDisconnect = treatTransferAsDisconnect
 	mcClient.RegisterDefaultHandlers()
 
-	// Initialize LLM manager
+	// Initialize command framework (always available)
+	RegisterDefaultCommands()
+	InitWordle(mcClient)
+	defer ShutdownWordle()
+	log.Println("Command mode initialized. Use !help to see available commands.")
+
+	// Initialize LLM manager for conversation mode (optional)
+	var manager *LLMManager
 	manager, err := NewLLMManager(mcClient)
 	if err != nil {
-		log.Fatalf("Failed to initialize LLM manager: %v", err)
+		log.Printf("Conversation mode disabled: %v", err)
+		log.Println("Bot will only respond to commands (! prefix)")
+	} else {
+		log.Println("Conversation mode enabled.")
+		defer manager.Shutdown()
 	}
-	defer manager.Shutdown()
 
 	initChatHandlers(manager)
 	mcClient.RegisterHandler(graceChatHandler)
