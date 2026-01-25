@@ -45,10 +45,14 @@ func main() {
 	mcClient.TreatTransferAsDisconnect = treatTransferAsDisconnect
 	mcClient.RegisterDefaultHandlers()
 
+	// Initialize player data system (must be first)
+	InitPlayerData()
+	defer ShutdownPlayerData()
+
 	// Initialize command framework (always available)
 	RegisterDefaultCommands()
 	InitWordle(mcClient)
-	defer ShutdownWordle()
+	InitSing(mcClient)
 	log.Println("Command mode initialized. Use !help to see available commands.")
 
 	// Initialize LLM manager for conversation mode (optional)

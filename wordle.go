@@ -7,8 +7,6 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
-	"os"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -16,8 +14,6 @@ import (
 
 	"github.com/go-mclib/client/client"
 )
-
-const wordlePointsFile = "wordle_points.json"
 
 const (
 	defaultWordLength = 5
@@ -42,8 +38,6 @@ type WordleManager struct {
 	activeGame *WordleGame
 	mu         sync.Mutex
 	mcClient   *client.Client
-	points     map[string]int // player name (lowercase) -> points
-	pointsMu   sync.RWMutex
 }
 
 // Global wordle manager
@@ -53,100 +47,11 @@ var wordleManager *WordleManager
 func InitWordle(c *client.Client) {
 	wordleManager = &WordleManager{
 		mcClient: c,
-		points:   make(map[string]int),
 	}
 
-	// Load points from file
-	wordleManager.loadPoints()
-
-	// Register wordle commands
-	RegisterCommand("wordle", "Start a word guessing game", "!wordle [length] (default: 5)", wordleCommand)
-	RegisterCommand("wstop", "Stop the current wordle game", "!wstop", wordleStopCommand)
-	RegisterCommand("wordlepoints", "Show wordle points", "!wordlepoints [player]", wordlePointsCommand)
-}
-
-// ShutdownWordle saves points to file
-func ShutdownWordle() {
-	if wordleManager != nil {
-		wordleManager.savePoints()
-	}
-}
-
-// loadPoints loads points from JSON file
-func (m *WordleManager) loadPoints() {
-	data, err := os.ReadFile(wordlePointsFile)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Printf("[Wordle] Failed to load points: %v", err)
-		}
-		return
-	}
-
-	m.pointsMu.Lock()
-	defer m.pointsMu.Unlock()
-
-	if err := json.Unmarshal(data, &m.points); err != nil {
-		log.Printf("[Wordle] Failed to parse points file: %v", err)
-		return
-	}
-	log.Printf("[Wordle] Loaded %d player scores", len(m.points))
-}
-
-// savePoints saves points to JSON file
-func (m *WordleManager) savePoints() {
-	m.pointsMu.RLock()
-	defer m.pointsMu.RUnlock()
-
-	data, err := json.MarshalIndent(m.points, "", "  ")
-	if err != nil {
-		log.Printf("[Wordle] Failed to marshal points: %v", err)
-		return
-	}
-
-	if err := os.WriteFile(wordlePointsFile, data, 0644); err != nil {
-		log.Printf("[Wordle] Failed to save points: %v", err)
-		return
-	}
-	log.Printf("[Wordle] Saved %d player scores", len(m.points))
-}
-
-// addPoint adds a point for a player
-func (m *WordleManager) addPoint(player string) {
-	m.pointsMu.Lock()
-	defer m.pointsMu.Unlock()
-	m.points[strings.ToLower(player)]++
-}
-
-// getPoints gets points for a player (case insensitive)
-func (m *WordleManager) getPoints(player string) int {
-	m.pointsMu.RLock()
-	defer m.pointsMu.RUnlock()
-	return m.points[strings.ToLower(player)]
-}
-
-// getTopPlayer returns the top player and their points
-func (m *WordleManager) getTopPlayer() (string, int) {
-	m.pointsMu.RLock()
-	defer m.pointsMu.RUnlock()
-
-	if len(m.points) == 0 {
-		return "", 0
-	}
-
-	// Sort by points descending
-	type playerScore struct {
-		name   string
-		points int
-	}
-	scores := make([]playerScore, 0, len(m.points))
-	for name, pts := range m.points {
-		scores = append(scores, playerScore{name, pts})
-	}
-	sort.Slice(scores, func(i, j int) bool {
-		return scores[i].points > scores[j].points
-	})
-
-	return scores[0].name, scores[0].points
+	// Register wordle commands (everyone can use)
+	RegisterCommand("wordle", "Start a word guessing game", "!wordle [length] (default: 5)", []string{"admin"}, wordleCommand)
+	RegisterCommand("wordlepoints", "Show wordle points", "!wordlepoints [player]", nil, wordlePointsCommand)
 }
 
 // wordlePointsCommand handles the !wordlepoints command
@@ -154,13 +59,13 @@ func wordlePointsCommand(c *client.Client, sender string, args []string) {
 	if len(args) > 0 {
 		// Show points for specific player
 		player := args[0]
-		points := wordleManager.getPoints(player)
+		points := GetWordlePoints(player)
 		c.SendChatMessage(fmt.Sprintf("%s: %d", player, points))
 		return
 	}
 
 	// Show top player
-	topPlayer, topPoints := wordleManager.getTopPlayer()
+	topPlayer, topPoints := GetTopWordlePlayer()
 	if topPlayer == "" {
 		c.SendChatMessage("No wordle scores yet!")
 		return
@@ -217,24 +122,32 @@ func wordleCommand(c *client.Client, sender string, args []string) {
 		sender, length, maxGuesses, wordleManager.activeGame.GetProgressDisplay()))
 }
 
-// wordleStopCommand handles the !wstop command
-func wordleStopCommand(c *client.Client, sender string, args []string) {
+// StopWordle stops the current wordle game, returns true if a game was stopped
+func StopWordle(c *client.Client) bool {
+	if wordleManager == nil {
+		return false
+	}
+
 	wordleManager.mu.Lock()
 	defer wordleManager.mu.Unlock()
 
 	if wordleManager.activeGame == nil {
-		c.SendChatMessage("No game is currently active.")
-		return
+		return false
 	}
 
 	word := wordleManager.activeGame.Word
 	wordleManager.activeGame = nil
-	c.SendChatMessage(fmt.Sprintf("Game stopped. The word was: %s", word))
+	c.SendChatMessage(fmt.Sprintf("Wordle stopped. The word was: %s", word))
+	return true
 }
 
 // ProcessGuess checks if a message is a valid guess and processes it
 // Returns true if the message was processed as a guess
 func ProcessGuess(c *client.Client, sender, message string) bool {
+	if wordleManager == nil {
+		return false
+	}
+
 	wordleManager.mu.Lock()
 	defer wordleManager.mu.Unlock()
 
@@ -272,8 +185,8 @@ func ProcessGuess(c *client.Client, sender, message string) bool {
 
 	// Check for exact match
 	if guess == game.Word {
-		wordleManager.addPoint(sender)
-		points := wordleManager.getPoints(sender)
+		AddWordlePoint(sender)
+		points := GetWordlePoints(sender)
 		c.SendChatMessage(fmt.Sprintf("Correct! %s guessed %s in %d guesses! (Total: %d)", sender, game.Word, len(game.Guesses), points))
 		wordleManager.activeGame = nil
 		return true
@@ -381,13 +294,13 @@ func fetchRandomWord(length int) (string, error) {
 
 // Fallback word lists by length
 var fallbackWords = map[int][]string{
-	3: {"cat", "dog", "sun", "run", "fun", "hat", "bat", "car", "jar", "bar"},
-	4: {"word", "game", "play", "time", "love", "home", "book", "tree", "star", "moon"},
-	5: {"world", "games", "words", "music", "happy", "party", "money", "water", "light", "dream"},
-	6: {"friend", "family", "player", "garden", "castle", "dragon", "knight", "wizard", "forest", "planet"},
-	7: {"another", "morning", "evening", "weather", "journey", "mystery", "fantasy", "kingdom", "diamond", "rainbow"},
-	8: {"computer", "building", "mountain", "treasure", "champion", "surprise", "strength", "football", "birthday", "shopping"},
-	9: {"adventure", "beautiful", "challenge", "dangerous", "excellent", "fantastic", "happiness", "important", "knowledge", "wonderful"},
+	3:  {"cat", "dog", "sun", "run", "fun", "hat", "bat", "car", "jar", "bar"},
+	4:  {"word", "game", "play", "time", "love", "home", "book", "tree", "star", "moon"},
+	5:  {"world", "games", "words", "music", "happy", "party", "money", "water", "light", "dream"},
+	6:  {"friend", "family", "player", "garden", "castle", "dragon", "knight", "wizard", "forest", "planet"},
+	7:  {"another", "morning", "evening", "weather", "journey", "mystery", "fantasy", "kingdom", "diamond", "rainbow"},
+	8:  {"computer", "building", "mountain", "treasure", "champion", "surprise", "strength", "football", "birthday", "shopping"},
+	9:  {"adventure", "beautiful", "challenge", "dangerous", "excellent", "fantastic", "happiness", "important", "knowledge", "wonderful"},
 	10: {"basketball", "absolutely", "background", "celebrated", "determined", "everything", "friendship", "generation", "helicopter", "impossible"},
 }
 
