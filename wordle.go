@@ -155,7 +155,8 @@ func wordleCommand(c *client.Client, sender string, args []string) {
 		return
 	}
 
-	length := len(word)
+	// Use rune length to properly handle Unicode characters
+	length := len([]rune(word))
 	if length < minWordLength || length > maxWordLength {
 		c.SendChatMessage(fmt.Sprintf("Word must be between %d and %d letters", minWordLength, maxWordLength))
 		return
@@ -219,12 +220,14 @@ func ProcessGuess(c *client.Client, sender, message string) bool {
 
 	// Check if message is the right length and all letters
 	message = strings.TrimSpace(message)
-	if len(message) != game.Length {
+	messageRunes := []rune(message)
+
+	if len(messageRunes) != game.Length {
 		return false
 	}
 
 	// Check if all characters are letters
-	for _, r := range message {
+	for _, r := range messageRunes {
 		if !unicode.IsLetter(r) {
 			return false
 		}
