@@ -48,7 +48,7 @@ func InitSing(c *client.Client) {
 		mcClient: c,
 	}
 
-	RegisterCommand("sing", "Sing lyrics of a song", "!sing <song name>", []string{"admin"}, singCommand)
+	RegisterCommand("sing", "Sing lyrics of a song", "!sing <song name>", []string{"admin", "trusted"}, singCommand)
 }
 
 // lrcLibResponse represents the response from lrclib.net API
