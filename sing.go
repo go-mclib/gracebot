@@ -238,15 +238,15 @@ func fetchLyrics(query string) ([]LyricLine, string, string, error) {
 func parseLRC(lrc string) []LyricLine {
 	var lyrics []LyricLine
 	// Match [mm:ss.xx] or [mm:ss]
-	re := regexp.MustCompile(`\[(\d+):(\d+)(?:\.(\d+))?\](.*)`)
+	timeRe := regexp.MustCompile(`\[(\d+):(\d+)(?:\.(\d+))?\](.*)`)
 
-	for _, line := range strings.Split(lrc, "\n") {
+	for line := range strings.SplitSeq(lrc, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
 
-		matches := re.FindStringSubmatch(line)
+		matches := timeRe.FindStringSubmatch(line)
 		if matches == nil {
 			continue
 		}
@@ -290,7 +290,7 @@ func parsePlainLyrics(plain string) []LyricLine {
 	var lyrics []LyricLine
 	timestamp := time.Duration(0)
 
-	for _, line := range strings.Split(plain, "\n") {
+	for line := range strings.SplitSeq(plain, "\n") {
 		line = strings.TrimSpace(line)
 		lyrics = append(lyrics, LyricLine{
 			Time: timestamp,
