@@ -49,11 +49,8 @@ func main() {
 	InitPlayerData()
 	defer ShutdownPlayerData()
 
-	// Initialize command framework (always available)
-	RegisterDefaultCommands()
-	InitLexicon()
-	InitWordGuessing(mcClient)
-	InitSing(mcClient)
+	// Set client for commands (commands auto-register via init())
+	SetClient(mcClient)
 	log.Println("Command mode initialized. Use !help to see available commands.")
 
 	// Initialize LLM manager for conversation mode (optional)

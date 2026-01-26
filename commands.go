@@ -32,6 +32,19 @@ var commandRegistry = &CommandRegistry{
 	commands: make(map[string]*Command),
 }
 
+// Global client for commands that need it
+var mcClient *client.Client
+
+// SetClient sets the global client for all commands
+func SetClient(c *client.Client) {
+	mcClient = c
+}
+
+// GetClient returns the global client
+func GetClient() *client.Client {
+	return mcClient
+}
+
 // RegisterCommand adds a command to the registry
 // ranks can be nil/empty for commands anyone can use
 func RegisterCommand(name, description, usage string, ranks []string, handler CommandHandler) {
@@ -119,8 +132,7 @@ func HandleCommand(c *client.Client, sender, message string) bool {
 	return true
 }
 
-// RegisterDefaultCommands registers the built-in commands
-func RegisterDefaultCommands() {
+func init() {
 	// Everyone can use these
 	RegisterCommand("help", "Shows available commands", "!help [command]", nil, helpCommand)
 	RegisterCommand("stop", "Stop any ongoing activity", "!stop", nil, stopCommand)

@@ -12,8 +12,7 @@ import (
 	"github.com/go-mclib/client/client"
 )
 
-// InitLexicon registers lexicon-related commands
-func InitLexicon() {
+func init() {
 	RegisterCommand("define", "Define a word", "!define <word>", nil, defineCommand)
 	RegisterCommand("urban", "Urban Dictionary lookup", "!urban <phrase>", nil, urbanCommand)
 }

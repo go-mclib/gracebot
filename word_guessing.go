@@ -48,23 +48,14 @@ type WordGuessingGame struct {
 type WordGuessingManager struct {
 	activeGame *WordGuessingGame
 	mu         sync.Mutex
-	mcClient   *client.Client
 }
 
 // Global word guessing manager
-var wordGuessingManager *WordGuessingManager
+var wordGuessingManager = &WordGuessingManager{}
 
-// InitWordGuessing initializes the word guessing game system
-func InitWordGuessing(c *client.Client) {
-	wordGuessingManager = &WordGuessingManager{
-		mcClient: c,
-	}
-
-	// Register wordle commands
+func init() {
 	RegisterCommand("wordle", "Start a word guessing game", "!wordle [word|length] [attempts]", []string{"admin"}, wordleCommand)
 	RegisterCommand("wordlepoints", "Show wordle points", "!wordlepoints [player]", nil, wordlePointsCommand)
-
-	// Register hangman commands
 	RegisterCommand("hangman", "Start a hangman game", "!hangman [word|length] [attempts]", []string{"admin"}, hangmanCommand)
 }
 

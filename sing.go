@@ -36,18 +36,12 @@ type SingSession struct {
 type SingManager struct {
 	activeSession *SingSession
 	mu            sync.Mutex
-	mcClient      *client.Client
 }
 
 // Global sing manager
-var singManager *SingManager
+var singManager = &SingManager{}
 
-// InitSing initializes the singing system
-func InitSing(c *client.Client) {
-	singManager = &SingManager{
-		mcClient: c,
-	}
-
+func init() {
 	RegisterCommand("sing", "Sing lyrics of a song", "!sing <song name>", []string{"admin", "trusted"}, singCommand)
 }
 
