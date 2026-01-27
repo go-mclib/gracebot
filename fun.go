@@ -15,12 +15,22 @@ import (
 )
 
 func init() {
+	RegisterCommand("say", "Say something", "!say <message>", nil, sayCommand)
 	RegisterCommand("8ball", "Ask the magic 8-ball", "!8ball <question>", nil, eightBallCommand)
 	RegisterCommand("roll", "Roll dice", "!roll [NdN]", nil, rollCommand)
 	RegisterCommand("flip", "Flip a coin", "!flip", nil, flipCommand)
 	RegisterCommand("choose", "Random choice", "!choose <opt1> | <opt2> | ...", nil, chooseCommand)
 	RegisterCommand("quote", "Random quote", "!quote", nil, quoteCommand)
 	RegisterCommand("fact", "Random fun fact", "!fact", nil, factCommand)
+}
+
+func sayCommand(c *client.Client, sender string, args []string) {
+	if len(args) == 0 {
+		c.SendChatMessage("Usage: !say <message>")
+		return
+	}
+	message := strings.Join(args, " ")
+	c.SendChatMessage(message)
 }
 
 var eightBallResponses = []string{
