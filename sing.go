@@ -25,11 +25,12 @@ type LyricLine struct {
 
 // SingSession represents an active singing session
 type SingSession struct {
-	Track    string
-	Artist   string
-	Lyrics   []LyricLine
-	StartAt  time.Time
-	StopChan chan struct{}
+	Track     string
+	Artist    string
+	Lyrics    []LyricLine
+	StartAt   time.Time
+	StartedBy string
+	StopChan  chan struct{}
 }
 
 // SingManager manages singing sessions
@@ -90,11 +91,12 @@ func singCommand(c *client.Client, sender string, args []string) {
 
 	singManager.mu.Lock()
 	singManager.activeSession = &SingSession{
-		Track:    track,
-		Artist:   artist,
-		Lyrics:   lyrics,
-		StartAt:  time.Now(),
-		StopChan: make(chan struct{}),
+		Track:     track,
+		Artist:    artist,
+		Lyrics:    lyrics,
+		StartAt:   time.Now(),
+		StartedBy: sender,
+		StopChan:  make(chan struct{}),
 	}
 	session := singManager.activeSession
 	singManager.mu.Unlock()
@@ -150,21 +152,27 @@ func (m *SingManager) playSong(c *client.Client, session *SingSession) {
 }
 
 // StopSinging stops the current singing session
-func StopSinging() bool {
+// Returns (stopped, permissionDenied)
+func StopSinging(sender string) (bool, bool) {
 	if singManager == nil {
-		return false
+		return false, false
 	}
 
 	singManager.mu.Lock()
 	defer singManager.mu.Unlock()
 
 	if singManager.activeSession == nil {
-		return false
+		return false, false
+	}
+
+	// Check if sender has permission to stop (same as permission to start: admin or trusted)
+	if !HasRank(sender, "admin") && !HasRank(sender, "trusted") {
+		return false, true
 	}
 
 	close(singManager.activeSession.StopChan)
 	singManager.activeSession = nil
-	return true
+	return true, false
 }
 
 // IsSinging returns true if currently singing

@@ -146,15 +146,25 @@ func init() {
 // stopCommand stops any ongoing activity (wordle, singing, etc.)
 func stopCommand(c *client.Client, sender string, args []string) {
 	stopped := false
+	denied := false
 
 	// Try to stop wordle
-	if StopWordle(c) {
+	if ok, permDenied := StopWordle(c, sender); ok {
 		stopped = true
+	} else if permDenied {
+		denied = true
 	}
 
 	// Try to stop singing
-	if StopSinging() {
+	if ok, permDenied := StopSinging(sender); ok {
 		stopped = true
+	} else if permDenied {
+		denied = true
+	}
+
+	if denied && !stopped {
+		c.SendChatMessage("You don't have permission to stop that.")
+		return
 	}
 
 	if !stopped {

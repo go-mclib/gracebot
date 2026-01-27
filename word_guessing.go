@@ -202,17 +202,23 @@ func hangmanCommand(c *client.Client, sender string, args []string) {
 	startGame(c, sender, args, GameTypeHangman)
 }
 
-// StopWordle stops the current word guessing game, returns true if a game was stopped
-func StopWordle(c *client.Client) bool {
+// StopWordle stops the current word guessing game
+// Returns (stopped, permissionDenied)
+func StopWordle(c *client.Client, sender string) (bool, bool) {
 	if wordGuessingManager == nil {
-		return false
+		return false, false
 	}
 
 	wordGuessingManager.mu.Lock()
 	defer wordGuessingManager.mu.Unlock()
 
 	if wordGuessingManager.activeGame == nil {
-		return false
+		return false, false
+	}
+
+	// Check if sender has permission to stop (same as permission to start: admin only)
+	if !HasRank(sender, "admin") {
+		return false, true
 	}
 
 	gameName := "Wordle"
@@ -223,7 +229,7 @@ func StopWordle(c *client.Client) bool {
 	word := wordGuessingManager.activeGame.Word
 	wordGuessingManager.activeGame = nil
 	c.SendChatMessage(fmt.Sprintf("%s stopped. The word was: %s", gameName, word))
-	return true
+	return true, false
 }
 
 // ProcessGuess checks if a message is a valid guess and processes it
