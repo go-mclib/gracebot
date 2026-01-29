@@ -11,7 +11,7 @@ import (
 )
 
 // deathMessageRegex matches death messages like "death.attack.outOfWorld [HIPPO84]"
-var deathMessageRegex = regexp.MustCompile(`^death\.[a-zA-Z._]+ \[([^\]]+)\]`)
+var deathMessageRegex = regexp.MustCompile(`^(death\.[a-zA-Z._]+) \[([^\]]+)\]`)
 
 var llmManager *LLMManager
 var conversationEnabled bool
@@ -75,8 +75,9 @@ func graceChatHandler(c *client.Client, pkt *jp.Packet) {
 
 			// Check for death messages
 			if matches := deathMessageRegex.FindStringSubmatch(content); matches != nil {
-				player := matches[1]
-				AddDeath(player, content)
+				player := matches[2]
+				deathType := matches[1]
+				AddDeath(player, deathType)
 			}
 
 			if content != "" && !shouldFilterMessage(content) {

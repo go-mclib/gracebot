@@ -94,7 +94,6 @@ func singCommand(c *client.Client, sender string, args []string) {
 		Track:     track,
 		Artist:    artist,
 		Lyrics:    lyrics,
-		StartAt:   time.Now(),
 		StartedBy: sender,
 		StopChan:  make(chan struct{}),
 	}
@@ -103,8 +102,30 @@ func singCommand(c *client.Client, sender string, args []string) {
 
 	c.SendChatMessage(fmt.Sprintf("Now singing: %s - %s", artist, track))
 
-	// Start singing in background
-	go singManager.playSong(c, session)
+	// Start singing in background with countdown
+	go singManager.playSongWithCountdown(c, session)
+}
+
+// playSongWithCountdown does a 3-2-1 countdown then plays the song
+func (m *SingManager) playSongWithCountdown(c *client.Client, session *SingSession) {
+	// Countdown from 3
+	for i := 3; i >= 1; i-- {
+		select {
+		case <-session.StopChan:
+			c.SendChatMessage("Stopped singing.")
+			m.mu.Lock()
+			m.activeSession = nil
+			m.mu.Unlock()
+			return
+		default:
+		}
+		c.SendChatMessage(fmt.Sprintf("%d...", i))
+		time.Sleep(1 * time.Second)
+	}
+
+	// Set the start time after countdown
+	session.StartAt = time.Now()
+	m.playSong(c, session)
 }
 
 // playSong plays the lyrics synchronized

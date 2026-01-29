@@ -23,7 +23,7 @@ type PlayerData struct {
 	LastSeen             int64          `json:"last_seen,omitempty"`              // Unix timestamp
 	TotalPlaytimeSeconds int64          `json:"total_playtime_seconds,omitempty"` // Total playtime in seconds
 	WordCounts           map[string]int `json:"word_counts,omitempty"`            // Word -> count
-	Deaths               []string       `json:"deaths,omitempty"`                 // Raw death messages
+	DeathCounts          map[string]int `json:"death_counts,omitempty"`           // Death type -> count
 
 	// Non-persisted session tracking
 	sessionStart int64 `json:"-"` // Unix timestamp of current session start
@@ -262,8 +262,8 @@ func GetTopWordlePlayer() (string, int) {
 	return GetTopGamePlayer("wordle")
 }
 
-// AddDeath records a death for a player
-func AddDeath(username, deathMessage string) {
+// AddDeath records a death for a player with the death type
+func AddDeath(username, deathType string) {
 	if playerDataManager == nil {
 		return
 	}
@@ -271,11 +271,14 @@ func AddDeath(username, deathMessage string) {
 	playerDataManager.mu.Lock()
 	defer playerDataManager.mu.Unlock()
 
-	data.Deaths = append(data.Deaths, deathMessage)
+	if data.DeathCounts == nil {
+		data.DeathCounts = make(map[string]int)
+	}
+	data.DeathCounts[deathType]++
 }
 
-// GetDeaths returns all deaths for a player
-func GetDeaths(username string) []string {
+// GetDeathCounts returns all death type counts for a player
+func GetDeathCounts(username string) map[string]int {
 	if playerDataManager == nil {
 		return nil
 	}
@@ -284,12 +287,12 @@ func GetDeaths(username string) []string {
 
 	key := strings.ToLower(username)
 	if data, exists := playerDataManager.players[key]; exists {
-		return data.Deaths
+		return data.DeathCounts
 	}
 	return nil
 }
 
-// GetDeathCount returns the death count for a player
+// GetDeathCount returns the total death count for a player
 func GetDeathCount(username string) int {
 	if playerDataManager == nil {
 		return 0
@@ -298,58 +301,109 @@ func GetDeathCount(username string) int {
 	defer playerDataManager.mu.RUnlock()
 
 	key := strings.ToLower(username)
-	if data, exists := playerDataManager.players[key]; exists {
-		return len(data.Deaths)
+	if data, exists := playerDataManager.players[key]; exists && data.DeathCounts != nil {
+		total := 0
+		for _, count := range data.DeathCounts {
+			total += count
+		}
+		return total
 	}
 	return 0
 }
 
-// GetTopDeaths returns the top N players by death count
-func GetTopDeaths(n int) []struct {
-	Player string
-	Count  int
+// GetDeathTypeCount returns the count of a specific death type for a player
+func GetDeathTypeCount(username, deathType string) int {
+	if playerDataManager == nil {
+		return 0
+	}
+	playerDataManager.mu.RLock()
+	defer playerDataManager.mu.RUnlock()
+
+	key := strings.ToLower(username)
+	if data, exists := playerDataManager.players[key]; exists && data.DeathCounts != nil {
+		return data.DeathCounts[deathType]
+	}
+	return 0
+}
+
+// GetTopDeathCauses returns the top N death causes for a player, sorted by count
+func GetTopDeathCauses(username string, n int) []struct {
+	Type  string
+	Count int
 } {
 	if playerDataManager == nil {
 		return nil
+	}
+	playerDataManager.mu.RLock()
+	defer playerDataManager.mu.RUnlock()
+
+	key := strings.ToLower(username)
+	data, exists := playerDataManager.players[key]
+	if !exists || data.DeathCounts == nil {
+		return nil
+	}
+
+	type deathCause struct {
+		Type  string
+		Count int
+	}
+
+	var causes []deathCause
+	for dtype, count := range data.DeathCounts {
+		causes = append(causes, deathCause{Type: dtype, Count: count})
+	}
+
+	// Sort by count descending
+	for i := range len(causes) {
+		for j := i + 1; j < len(causes); j++ {
+			if causes[j].Count > causes[i].Count {
+				causes[i], causes[j] = causes[j], causes[i]
+			}
+		}
+	}
+
+	if n > len(causes) {
+		n = len(causes)
+	}
+
+	result := make([]struct {
+		Type  string
+		Count int
+	}, n)
+	for i := range n {
+		result[i].Type = causes[i].Type
+		result[i].Count = causes[i].Count
+	}
+	return result
+}
+
+// GetPlayerWithMostDeaths returns the player with the most total deaths
+func GetPlayerWithMostDeaths() (string, int) {
+	if playerDataManager == nil {
+		return "", 0
 	}
 
 	playerDataManager.mu.RLock()
 	defer playerDataManager.mu.RUnlock()
 
-	type playerDeaths struct {
-		Player string
-		Count  int
-	}
+	var topPlayer string
+	var topCount int
 
-	var all []playerDeaths
 	for name, data := range playerDataManager.players {
-		if len(data.Deaths) > 0 {
-			all = append(all, playerDeaths{Player: name, Count: len(data.Deaths)})
+		if data.DeathCounts == nil {
+			continue
+		}
+		total := 0
+		for _, count := range data.DeathCounts {
+			total += count
+		}
+		if total > topCount {
+			topPlayer = name
+			topCount = total
 		}
 	}
 
-	// Sort by count descending
-	for i := range len(all) {
-		for j := i + 1; j < len(all); j++ {
-			if all[j].Count > all[i].Count {
-				all[i], all[j] = all[j], all[i]
-			}
-		}
-	}
-
-	if n > len(all) {
-		n = len(all)
-	}
-
-	result := make([]struct {
-		Player string
-		Count  int
-	}, n)
-	for i := range n {
-		result[i].Player = all[i].Player
-		result[i].Count = all[i].Count
-	}
-	return result
+	return topPlayer, topCount
 }
 
 // IsAdmin checks if a player is an admin

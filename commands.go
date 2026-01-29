@@ -141,7 +141,7 @@ func init() {
 	RegisterCommand("playtime", "Check player playtime", "!playtime [player]", nil, playtimeCommand)
 	RegisterCommand("seen", "When was a player last seen", "!seen [player]", nil, seenCommand)
 	RegisterCommand("wordcount", "Count word usage", "!wordcount <word> [player]", nil, wordcountCommand)
-	RegisterCommand("deaths", "Show death count", "!deaths [player]", nil, deathsCommand)
+	RegisterCommand("deaths", "Show death stats", "!deaths [player] [death_type]", nil, deathsCommand)
 
 	// Admin only
 	RegisterCommand("addrank", "Add rank to player", "!addrank <player> <rank>", []string{"admin"}, addRankCommand)
@@ -307,32 +307,47 @@ func wordcountCommand(c *client.Client, sender string, args []string) {
 	}
 }
 
-// deathsCommand shows death count for a player or top deaths
+// deathsCommand shows death stats for a player
 func deathsCommand(c *client.Client, sender string, args []string) {
-	if len(args) > 0 {
-		// Show deaths for specific player
-		player := args[0]
-		count := GetDeathCount(player)
-		if count == 0 {
-			c.SendChatMessage(fmt.Sprintf("%s has no recorded deaths.", player))
+	var player string
+	var deathType string
+
+	if len(args) >= 2 {
+		// !deaths <player> <death_type>
+		player = args[0]
+		deathType = args[1]
+	} else if len(args) == 1 {
+		// !deaths <player>
+		player = args[0]
+	} else {
+		// !deaths - show player with most deaths
+		topPlayer, topCount := GetPlayerWithMostDeaths()
+		if topPlayer == "" || topCount == 0 {
+			c.SendChatMessage("No deaths recorded yet!")
 			return
 		}
-		c.SendChatMessage(fmt.Sprintf("%s has died %d times", player, count))
+		player = topPlayer
+	}
+
+	// If death type specified, show count for that type
+	if deathType != "" {
+		count := GetDeathTypeCount(player, deathType)
+		c.SendChatMessage(fmt.Sprintf("%s: %s=%d", player, deathType, count))
 		return
 	}
 
-	// Show top deaths
-	top := GetTopDeaths(5)
-	if len(top) == 0 {
-		c.SendChatMessage("No deaths recorded yet!")
+	// Show top 3 death causes for player
+	topCauses := GetTopDeathCauses(player, 3)
+	if len(topCauses) == 0 {
+		c.SendChatMessage(fmt.Sprintf("%s has no recorded deaths.", player))
 		return
 	}
 
 	var parts []string
-	for _, p := range top {
-		parts = append(parts, fmt.Sprintf("%s: %d", p.Player, p.Count))
+	for _, cause := range topCauses {
+		parts = append(parts, fmt.Sprintf("%s=%d", cause.Type, cause.Count))
 	}
-	c.SendChatMessage("Top deaths: " + strings.Join(parts, ", "))
+	c.SendChatMessage(fmt.Sprintf("%s: %s", player, strings.Join(parts, ", ")))
 }
 
 // formatDuration formats a duration in a human readable way
