@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -16,8 +17,16 @@ const (
 
 // PlayerData represents stored data for a player
 type PlayerData struct {
-	WordlePoints int      `json:"wordle_points"`
-	Ranks        []string `json:"ranks,omitempty"`
+	WordlePoints         int            `json:"wordle_points,omitempty"`          // Deprecated: use GamePoints["wordle"]
+	GamePoints           map[string]int `json:"game_points,omitempty"`            // Game -> points
+	Ranks                []string       `json:"ranks,omitempty"`
+	LastSeen             int64          `json:"last_seen,omitempty"`              // Unix timestamp
+	TotalPlaytimeSeconds int64          `json:"total_playtime_seconds,omitempty"` // Total playtime in seconds
+	WordCounts           map[string]int `json:"word_counts,omitempty"`            // Word -> count
+	Deaths               []string       `json:"deaths,omitempty"`                 // Raw death messages
+
+	// Non-persisted session tracking
+	sessionStart int64 `json:"-"` // Unix timestamp of current session start
 }
 
 // PlayerDataManager manages player data
@@ -162,8 +171,8 @@ func (m *PlayerDataManager) getOrCreatePlayer(username string) *PlayerData {
 	return m.players[key]
 }
 
-// GetWordlePoints gets wordle points for a player
-func GetWordlePoints(username string) int {
+// GetGamePoints gets points for a specific game for a player
+func GetGamePoints(username, game string) int {
 	if playerDataManager == nil {
 		return 0
 	}
@@ -171,25 +180,44 @@ func GetWordlePoints(username string) int {
 	defer playerDataManager.mu.RUnlock()
 
 	key := strings.ToLower(username)
+	gameLower := strings.ToLower(game)
 	if data, exists := playerDataManager.players[key]; exists {
-		return data.WordlePoints
+		if data.GamePoints != nil {
+			return data.GamePoints[gameLower]
+		}
+		// Migration: check old WordlePoints field
+		if gameLower == "wordle" && data.WordlePoints > 0 {
+			return data.WordlePoints
+		}
 	}
 	return 0
 }
 
-// AddWordlePoint adds a wordle point for a player
-func AddWordlePoint(username string) {
+// AddGamePoint adds a point for a specific game for a player
+func AddGamePoint(username, game string) {
 	if playerDataManager == nil {
 		return
 	}
 	data := playerDataManager.getOrCreatePlayer(username)
 	playerDataManager.mu.Lock()
-	data.WordlePoints++
-	playerDataManager.mu.Unlock()
+	defer playerDataManager.mu.Unlock()
+
+	if data.GamePoints == nil {
+		data.GamePoints = make(map[string]int)
+	}
+	gameLower := strings.ToLower(game)
+
+	// Migration: move old WordlePoints to GamePoints
+	if gameLower == "wordle" && data.WordlePoints > 0 && data.GamePoints["wordle"] == 0 {
+		data.GamePoints["wordle"] = data.WordlePoints
+		data.WordlePoints = 0
+	}
+
+	data.GamePoints[gameLower]++
 }
 
-// GetTopWordlePlayer returns the top wordle player and their points
-func GetTopWordlePlayer() (string, int) {
+// GetTopGamePlayer returns the top player for a specific game and their points
+func GetTopGamePlayer(game string) (string, int) {
 	if playerDataManager == nil {
 		return "", 0
 	}
@@ -199,15 +227,129 @@ func GetTopWordlePlayer() (string, int) {
 
 	var topPlayer string
 	var topPoints int
+	gameLower := strings.ToLower(game)
 
 	for name, data := range playerDataManager.players {
-		if data.WordlePoints > topPoints {
+		points := 0
+		if data.GamePoints != nil {
+			points = data.GamePoints[gameLower]
+		}
+		// Migration: check old WordlePoints field
+		if gameLower == "wordle" && data.WordlePoints > points {
+			points = data.WordlePoints
+		}
+		if points > topPoints {
 			topPlayer = name
-			topPoints = data.WordlePoints
+			topPoints = points
 		}
 	}
 
 	return topPlayer, topPoints
+}
+
+// Deprecated: use GetGamePoints(username, "wordle") instead
+func GetWordlePoints(username string) int {
+	return GetGamePoints(username, "wordle")
+}
+
+// Deprecated: use AddGamePoint(username, "wordle") instead
+func AddWordlePoint(username string) {
+	AddGamePoint(username, "wordle")
+}
+
+// Deprecated: use GetTopGamePlayer("wordle") instead
+func GetTopWordlePlayer() (string, int) {
+	return GetTopGamePlayer("wordle")
+}
+
+// AddDeath records a death for a player
+func AddDeath(username, deathMessage string) {
+	if playerDataManager == nil {
+		return
+	}
+	data := playerDataManager.getOrCreatePlayer(username)
+	playerDataManager.mu.Lock()
+	defer playerDataManager.mu.Unlock()
+
+	data.Deaths = append(data.Deaths, deathMessage)
+}
+
+// GetDeaths returns all deaths for a player
+func GetDeaths(username string) []string {
+	if playerDataManager == nil {
+		return nil
+	}
+	playerDataManager.mu.RLock()
+	defer playerDataManager.mu.RUnlock()
+
+	key := strings.ToLower(username)
+	if data, exists := playerDataManager.players[key]; exists {
+		return data.Deaths
+	}
+	return nil
+}
+
+// GetDeathCount returns the death count for a player
+func GetDeathCount(username string) int {
+	if playerDataManager == nil {
+		return 0
+	}
+	playerDataManager.mu.RLock()
+	defer playerDataManager.mu.RUnlock()
+
+	key := strings.ToLower(username)
+	if data, exists := playerDataManager.players[key]; exists {
+		return len(data.Deaths)
+	}
+	return 0
+}
+
+// GetTopDeaths returns the top N players by death count
+func GetTopDeaths(n int) []struct {
+	Player string
+	Count  int
+} {
+	if playerDataManager == nil {
+		return nil
+	}
+
+	playerDataManager.mu.RLock()
+	defer playerDataManager.mu.RUnlock()
+
+	type playerDeaths struct {
+		Player string
+		Count  int
+	}
+
+	var all []playerDeaths
+	for name, data := range playerDataManager.players {
+		if len(data.Deaths) > 0 {
+			all = append(all, playerDeaths{Player: name, Count: len(data.Deaths)})
+		}
+	}
+
+	// Sort by count descending
+	for i := range len(all) {
+		for j := i + 1; j < len(all); j++ {
+			if all[j].Count > all[i].Count {
+				all[i], all[j] = all[j], all[i]
+			}
+		}
+	}
+
+	if n > len(all) {
+		n = len(all)
+	}
+
+	result := make([]struct {
+		Player string
+		Count  int
+	}, n)
+	for i := range n {
+		result[i].Player = all[i].Player
+		result[i].Count = all[i].Count
+	}
+	return result
 }
 
 // IsAdmin checks if a player is an admin
@@ -354,4 +496,138 @@ type RankError struct {
 
 func (e *RankError) Error() string {
 	return e.Message
+}
+
+// UpdatePlayerActivity updates the player's last seen time and manages session tracking
+func UpdatePlayerActivity(username string) {
+	if playerDataManager == nil {
+		return
+	}
+
+	now := time.Now().Unix()
+	data := playerDataManager.getOrCreatePlayer(username)
+
+	playerDataManager.mu.Lock()
+	defer playerDataManager.mu.Unlock()
+
+	// If no active session or session is stale (>5 minutes since last activity), start new session
+	if data.sessionStart == 0 || (data.LastSeen > 0 && now-data.LastSeen > 300) {
+		data.sessionStart = now
+	} else if data.LastSeen > 0 {
+		// Add time since last message to playtime
+		data.TotalPlaytimeSeconds += now - data.LastSeen
+	}
+
+	data.LastSeen = now
+}
+
+// GetLastSeen returns when a player was last seen
+func GetLastSeen(username string) time.Time {
+	if playerDataManager == nil {
+		return time.Time{}
+	}
+
+	playerDataManager.mu.RLock()
+	defer playerDataManager.mu.RUnlock()
+
+	key := strings.ToLower(username)
+	if data, exists := playerDataManager.players[key]; exists && data.LastSeen > 0 {
+		return time.Unix(data.LastSeen, 0)
+	}
+	return time.Time{}
+}
+
+// GetPlaytime returns the total tracked playtime for a player
+func GetPlaytime(username string) time.Duration {
+	if playerDataManager == nil {
+		return 0
+	}
+
+	playerDataManager.mu.RLock()
+	defer playerDataManager.mu.RUnlock()
+
+	key := strings.ToLower(username)
+	if data, exists := playerDataManager.players[key]; exists {
+		return time.Duration(data.TotalPlaytimeSeconds) * time.Second
+	}
+	return 0
+}
+
+// CountWords counts words in a message for a player (ignores messages with !)
+func CountWords(username, message string) {
+	if playerDataManager == nil {
+		return
+	}
+
+	// Ignore messages containing !
+	if strings.Contains(message, "!") {
+		return
+	}
+
+	data := playerDataManager.getOrCreatePlayer(username)
+
+	playerDataManager.mu.Lock()
+	defer playerDataManager.mu.Unlock()
+
+	if data.WordCounts == nil {
+		data.WordCounts = make(map[string]int)
+	}
+
+	words := strings.Fields(strings.ToLower(message))
+	for _, word := range words {
+		// Clean up word - keep only alphanumeric
+		cleaned := strings.Map(func(r rune) rune {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+				return r
+			}
+			return -1
+		}, word)
+		if cleaned != "" {
+			data.WordCounts[cleaned]++
+		}
+	}
+}
+
+// GetWordCount returns the count of a specific word for a player, or globally if username is empty
+func GetWordCount(word, username string) int {
+	if playerDataManager == nil {
+		return 0
+	}
+
+	playerDataManager.mu.RLock()
+	defer playerDataManager.mu.RUnlock()
+
+	wordLower := strings.ToLower(word)
+
+	if username != "" {
+		// Count for specific player
+		key := strings.ToLower(username)
+		if data, exists := playerDataManager.players[key]; exists && data.WordCounts != nil {
+			return data.WordCounts[wordLower]
+		}
+		return 0
+	}
+
+	// Global count across all players
+	total := 0
+	for _, data := range playerDataManager.players {
+		if data.WordCounts != nil {
+			total += data.WordCounts[wordLower]
+		}
+	}
+	return total
+}
+
+// PlayerExists checks if a player has any data stored
+func PlayerExists(username string) bool {
+	if playerDataManager == nil {
+		return false
+	}
+
+	playerDataManager.mu.RLock()
+	defer playerDataManager.mu.RUnlock()
+
+	key := strings.ToLower(username)
+	_, exists := playerDataManager.players[key]
+	return exists
 }

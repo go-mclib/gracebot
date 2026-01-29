@@ -15,7 +15,7 @@ import (
 )
 
 func init() {
-	RegisterCommand("say", "Say something", "!say <message>", nil, sayCommand)
+	RegisterCommand("say", "Say something", "!say <message>", []string{"admin", "trusted"}, sayCommand)
 	RegisterCommand("8ball", "Ask the magic 8-ball", "!8ball <question>", nil, eightBallCommand)
 	RegisterCommand("roll", "Roll dice", "!roll [NdN]", nil, rollCommand)
 	RegisterCommand("flip", "Flip a coin", "!flip", nil, flipCommand)

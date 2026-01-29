@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-mclib/client/client"
 )
@@ -137,6 +138,10 @@ func init() {
 	RegisterCommand("help", "Shows available commands", "!help [command]", nil, helpCommand)
 	RegisterCommand("stop", "Stop any ongoing activity", "!stop", nil, stopCommand)
 	RegisterCommand("rank", "Check player ranks", "!rank [player]", nil, rankCommand)
+	RegisterCommand("playtime", "Check player playtime", "!playtime [player]", nil, playtimeCommand)
+	RegisterCommand("seen", "When was a player last seen", "!seen [player]", nil, seenCommand)
+	RegisterCommand("wordcount", "Count word usage", "!wordcount <word> [player]", nil, wordcountCommand)
+	RegisterCommand("deaths", "Show death count", "!deaths [player]", nil, deathsCommand)
 
 	// Admin only
 	RegisterCommand("addrank", "Add rank to player", "!addrank <player> <rank>", []string{"admin"}, addRankCommand)
@@ -245,4 +250,108 @@ func delRankCommand(c *client.Client, sender string, args []string) {
 	}
 
 	c.SendChatMessage(fmt.Sprintf("Removed rank '%s' from %s", rank, player))
+}
+
+// playtimeCommand shows player playtime
+func playtimeCommand(c *client.Client, sender string, args []string) {
+	target := sender
+	if len(args) > 0 {
+		target = args[0]
+	}
+
+	if !PlayerExists(target) {
+		c.SendChatMessage(fmt.Sprintf("%s has no recorded data.", target))
+		return
+	}
+
+	playtime := GetPlaytime(target)
+	c.SendChatMessage(fmt.Sprintf("%s playtime: %s", target, formatDuration(playtime)))
+}
+
+// seenCommand shows when a player was last seen
+func seenCommand(c *client.Client, sender string, args []string) {
+	target := sender
+	if len(args) > 0 {
+		target = args[0]
+	}
+
+	lastSeen := GetLastSeen(target)
+	if lastSeen.IsZero() {
+		c.SendChatMessage(fmt.Sprintf("%s has never been seen.", target))
+		return
+	}
+
+	ago := time.Since(lastSeen)
+	c.SendChatMessage(fmt.Sprintf("%s was last seen %s ago", target, formatDuration(ago)))
+}
+
+// wordcountCommand shows word usage count
+func wordcountCommand(c *client.Client, sender string, args []string) {
+	if len(args) < 1 {
+		c.SendChatMessage("Usage: !wordcount <word> [player]")
+		return
+	}
+
+	word := args[0]
+	var player string
+	if len(args) > 1 {
+		player = args[1]
+	}
+
+	count := GetWordCount(word, player)
+
+	if player != "" {
+		c.SendChatMessage(fmt.Sprintf("%s has said '%s' %d times", player, word, count))
+	} else {
+		c.SendChatMessage(fmt.Sprintf("'%s' has been said %d times globally", word, count))
+	}
+}
+
+// deathsCommand shows death count for a player or top deaths
+func deathsCommand(c *client.Client, sender string, args []string) {
+	if len(args) > 0 {
+		// Show deaths for specific player
+		player := args[0]
+		count := GetDeathCount(player)
+		if count == 0 {
+			c.SendChatMessage(fmt.Sprintf("%s has no recorded deaths.", player))
+			return
+		}
+		c.SendChatMessage(fmt.Sprintf("%s has died %d times", player, count))
+		return
+	}
+
+	// Show top deaths
+	top := GetTopDeaths(5)
+	if len(top) == 0 {
+		c.SendChatMessage("No deaths recorded yet!")
+		return
+	}
+
+	var parts []string
+	for _, p := range top {
+		parts = append(parts, fmt.Sprintf("%s: %d", p.Player, p.Count))
+	}
+	c.SendChatMessage("Top deaths: " + strings.Join(parts, ", "))
+}
+
+// formatDuration formats a duration in a human readable way
+func formatDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+
+	days := int(d.Hours() / 24)
+	hours := int(d.Hours()) % 24
+	minutes := int(d.Minutes()) % 60
+	seconds := int(d.Seconds()) % 60
+
+	if days > 0 {
+		return fmt.Sprintf("%dd %dh %dm", days, hours, minutes)
+	}
+	if hours > 0 {
+		return fmt.Sprintf("%dh %dm %ds", hours, minutes, seconds)
+	}
+	if minutes > 0 {
+		return fmt.Sprintf("%dm %ds", minutes, seconds)
+	}
+	return fmt.Sprintf("%ds", seconds)
 }

@@ -2,12 +2,16 @@ package main
 
 import (
 	"log"
+	"regexp"
 	"strings"
 
 	"github.com/go-mclib/client/client"
 	packets "github.com/go-mclib/data/go/773/java_packets"
 	jp "github.com/go-mclib/protocol/java_protocol"
 )
+
+// deathMessageRegex matches death messages like "death.attack.outOfWorld [HIPPO84]"
+var deathMessageRegex = regexp.MustCompile(`^death\.[a-zA-Z._]+ \[([^\]]+)\]`)
 
 var llmManager *LLMManager
 var conversationEnabled bool
@@ -31,6 +35,10 @@ func graceChatHandler(c *client.Client, pkt *jp.Packet) {
 
 			message := string(d.Message)
 			if sender != "" && message != "" {
+				// Track player activity and word counts
+				UpdatePlayerActivity(sender)
+				CountWords(sender, message)
+
 				// Mode 1: Command handling (always active, ! prefix)
 				if HandleCommand(c, sender, message) {
 					return
@@ -63,6 +71,12 @@ func graceChatHandler(c *client.Client, pkt *jp.Packet) {
 					}
 				}()
 				return
+			}
+
+			// Check for death messages
+			if matches := deathMessageRegex.FindStringSubmatch(content); matches != nil {
+				player := matches[1]
+				AddDeath(player, content)
 			}
 
 			if content != "" && !shouldFilterMessage(content) {

@@ -55,27 +55,34 @@ var wordGuessingManager = &WordGuessingManager{}
 
 func init() {
 	RegisterCommand("wordle", "Start a word guessing game", "!wordle [word|length] [attempts]", []string{"admin"}, wordleCommand)
-	RegisterCommand("wordlepoints", "Show wordle points", "!wordlepoints [player]", nil, wordlePointsCommand)
 	RegisterCommand("hangman", "Start a hangman game", "!hangman [word|length] [attempts]", []string{"admin"}, hangmanCommand)
+	RegisterCommand("points", "Show game points", "!points <game> [player]", nil, pointsCommand)
 }
 
-// wordlePointsCommand handles the !wordlepoints command
-func wordlePointsCommand(c *client.Client, sender string, args []string) {
-	if len(args) > 0 {
+// pointsCommand handles the !points command
+func pointsCommand(c *client.Client, sender string, args []string) {
+	if len(args) < 1 {
+		c.SendChatMessage("Usage: !points <game> [player] (games: wordle, hangman)")
+		return
+	}
+
+	game := strings.ToLower(args[0])
+
+	if len(args) > 1 {
 		// Show points for specific player
-		player := args[0]
-		points := GetWordlePoints(player)
-		c.SendChatMessage(fmt.Sprintf("%s: %d", player, points))
+		player := args[1]
+		points := GetGamePoints(player, game)
+		c.SendChatMessage(fmt.Sprintf("%s %s points: %d", player, game, points))
 		return
 	}
 
 	// Show top player
-	topPlayer, topPoints := GetTopWordlePlayer()
+	topPlayer, topPoints := GetTopGamePlayer(game)
 	if topPlayer == "" {
-		c.SendChatMessage("No wordle scores yet!")
+		c.SendChatMessage(fmt.Sprintf("No %s scores yet!", game))
 		return
 	}
-	c.SendChatMessage(fmt.Sprintf("Top: %s: %d", topPlayer, topPoints))
+	c.SendChatMessage(fmt.Sprintf("Top %s: %s with %d", game, topPlayer, topPoints))
 }
 
 // isNumeric checks if a string is a number
@@ -288,9 +295,9 @@ func processWordleGuess(c *client.Client, sender, message string, game *WordGues
 	if guess == game.Word {
 		// Only award points for non-custom words
 		if !game.CustomWord {
-			AddWordlePoint(sender)
-			points := GetWordlePoints(sender)
-			c.SendChatMessage(fmt.Sprintf("Correct! %s guessed %s in %d guesses! (Total: %d)", sender, game.Word, len(game.Guesses), points))
+			AddGamePoint(sender, "wordle")
+			points := GetGamePoints(sender, "wordle")
+			c.SendChatMessage(fmt.Sprintf("Correct! %s guessed %s in %d guesses! (Wordle points: %d)", sender, game.Word, len(game.Guesses), points))
 		} else {
 			c.SendChatMessage(fmt.Sprintf("Correct! %s guessed %s in %d guesses!", sender, game.Word, len(game.Guesses)))
 		}
@@ -369,9 +376,9 @@ func processHangmanGuess(c *client.Client, sender, message string, game *WordGue
 	if allRevealed {
 		// Only award points for non-custom words
 		if !game.CustomWord {
-			AddWordlePoint(sender)
-			points := GetWordlePoints(sender)
-			c.SendChatMessage(fmt.Sprintf("Correct! %s completed %s! Wrong guesses: %d (Total: %d)",
+			AddGamePoint(sender, "hangman")
+			points := GetGamePoints(sender, "hangman")
+			c.SendChatMessage(fmt.Sprintf("Correct! %s completed %s! Wrong guesses: %d (Hangman points: %d)",
 				sender, game.Word, len(game.WrongGuesses), points))
 		} else {
 			c.SendChatMessage(fmt.Sprintf("Correct! %s completed %s! Wrong guesses: %d",
