@@ -1,0 +1,4 @@
+go 1.25.0
+
+// Keep GraceBot on its pinned revisions rather than the parent workspace's checkouts.
+use .

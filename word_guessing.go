@@ -1,536 +1,364 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log"
-	"math/rand"
-	"net/http"
-	"strconv"
+	"math/rand/v2"
 	"strings"
 	"sync"
-	"time"
-	"unicode"
-
-	"github.com/go-mclib/client/client"
 )
 
-// GameType represents the type of word guessing game
-type GameType int
+const gameHistoryLimit = 10
 
-const (
-	GameTypeWordle GameType = iota
-	GameTypeHangman
-)
-
-const (
-	defaultWordLength = 5
-	maxWordLength     = 15
-	minWordLength     = 3
-)
-
-// WordGuessingGame represents an active word guessing game
-type WordGuessingGame struct {
-	Type         GameType
-	Word         string
-	Length       int
-	Guesses      []string // For wordle: full word guesses; for hangman: single letters
-	Revealed     []bool   // Which letters have been revealed
-	WrongGuesses []string // For hangman: letters guessed that aren't in the word
-	MaxGuesses   int      // 0 = infinite
-	StartedBy    string
-	StartTime    time.Time
-	CustomWord   bool // True if word was provided by user
+type gameManager struct {
+	mu     sync.Mutex
+	store  *playerStore
+	active *wordGame
 }
 
-// WordGuessingManager manages word guessing games
-type WordGuessingManager struct {
-	activeGame *WordGuessingGame
-	mu         sync.Mutex
+type wordGame struct {
+	game         string
+	word         string
+	owner        string
+	custom       bool
+	maxAttempts  int
+	attemptsUsed int
+	guessCount   int
+	seen         map[string]struct{}
+	revealed     []bool
+	recent       []gameGuess
 }
 
-// Global word guessing manager
-var wordGuessingManager = &WordGuessingManager{}
-
-func init() {
-	RegisterCommand("wordle", "Start a word guessing game", "!wordle [word|length] [attempts]", []string{"admin"}, wordleCommand)
-	RegisterCommand("hangman", "Start a hangman game", "!hangman [word|length] [attempts]", []string{"admin"}, hangmanCommand)
-	RegisterCommand("points", "Show game points", "!points <game> [player]", nil, pointsCommand)
+type gameGuess struct {
+	Player  string   `json:"player"`
+	Guess   string   `json:"guess"`
+	Correct bool     `json:"correct"`
+	Letters []string `json:"letters,omitempty"`
 }
 
-// pointsCommand handles the !points command
-func pointsCommand(c *client.Client, sender string, args []string) {
-	if len(args) < 1 {
-		c.SendChatMessage("Usage: !points <game> [player] (games: wordle, hangman)")
-		return
+// gameResult is a detached snapshot; the answer is added only after a game ends.
+// Wordle progress reflects the latest guess, rather than combining clues into
+// an entire answer while the game is still active.
+type gameResult struct {
+	Status            string      `json:"status"`
+	Cooperative       bool        `json:"cooperative"`
+	Game              string      `json:"game,omitempty"`
+	Owner             string      `json:"owner,omitempty"`
+	Length            int         `json:"length,omitempty"`
+	CustomWord        bool        `json:"custom_word"`
+	Progress          string      `json:"progress,omitempty"`
+	MaxAttempts       int         `json:"max_attempts"`
+	Unlimited         bool        `json:"unlimited"`
+	AttemptsUsed      int         `json:"attempts_used"`
+	RemainingAttempts *int        `json:"remaining_attempts,omitempty"`
+	GuessCount        int         `json:"guess_count"`
+	RecentGuesses     []gameGuess `json:"recent_guesses,omitempty"`
+	Answer            string      `json:"answer,omitempty"`
+	Winner            string      `json:"winner,omitempty"`
+	PointsAwarded     int         `json:"points_awarded"`
+	WinnerPoints      *int        `json:"winner_points,omitempty"`
+}
+
+func newGameManager(store *playerStore) *gameManager {
+	return &gameManager{store: store}
+}
+
+func (m *gameManager) tools() []toolSpec {
+	return []toolSpec{
+		makeTool("start_game", "Start a shared cooperative Hangman or Wordle game. Any player may start. Refuses to replace an active game. Custom words earn no points; never repeat a custom answer in chat. Hangman charges only wrong guesses; Wordle charges every guess.", map[string]any{
+			"game":     map[string]any{"type": "string", "enum": []string{"hangman", "wordle"}},
+			"length":   map[string]any{"type": "integer", "minimum": 3, "maximum": 15, "description": "Default 5 for a random word; inferred from a custom word if omitted."},
+			"word":     map[string]any{"type": "string", "minLength": 3, "maxLength": 15, "pattern": "^[A-Za-z]+$", "description": "Optional custom answer; ASCII English letters only."},
+			"attempts": map[string]any{"type": "integer", "minimum": 0, "description": "Defaults to 6. Explicit 0 means unlimited."},
+		}, []string{"game"}, m.start),
+		makeTool("guess", "Submit a guess to the shared game as the requesting player. Hangman accepts a single letter or a full word; Wordle requires a full word of the game's length. Repeated guesses do not consume attempts. Wordle letter feedback is correct, present, or absent, with duplicate letters counted correctly.", map[string]any{
+			"guess": map[string]any{"type": "string", "minLength": 1, "maxLength": 15, "pattern": "^[A-Za-z]+$"},
+		}, []string{"guess"}, m.guess),
+		makeTool("game_status", "Show the shared game, progress, attempts, and up to ten recent guesses without revealing the active answer. Everyone plays the same game.", nil, nil, m.status),
+		makeTool("stop_game", "Stop the shared game and reveal its answer. Only the player who started it or an administrator may stop it. Stopping awards no points.", nil, nil, m.stop),
 	}
-
-	game := strings.ToLower(args[0])
-
-	if len(args) > 1 {
-		// Show points for specific player
-		player := args[1]
-		points := GetGamePoints(player, game)
-		c.SendChatMessage(fmt.Sprintf("%s %s points: %d", player, game, points))
-		return
-	}
-
-	// Show top player
-	topPlayer, topPoints := GetTopGamePlayer(game)
-	if topPlayer == "" {
-		c.SendChatMessage(fmt.Sprintf("No %s scores yet!", game))
-		return
-	}
-	c.SendChatMessage(fmt.Sprintf("Top %s: %s with %d", game, topPlayer, topPoints))
 }
 
-// isNumeric checks if a string is a number
-func isNumeric(s string) bool {
-	_, err := strconv.Atoi(s)
-	return err == nil
-}
-
-// isValidWord checks if a string contains only letters
-func isValidWord(s string) bool {
-	for _, r := range s {
-		if !unicode.IsLetter(r) {
-			return false
+func (m *gameManager) start(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
+	var args struct {
+		Game     string  `json:"game"`
+		Length   *int    `json:"length"`
+		Word     *string `json:"word"`
+		Attempts *int    `json:"attempts"`
+	}
+	if err := decodeArgs(raw, &args); err != nil {
+		return nil, err
+	}
+	if args.Game != "hangman" && args.Game != "wordle" {
+		return nil, fmt.Errorf("game must be hangman or wordle")
+	}
+	length, attempts := 5, 6
+	if args.Length != nil {
+		length = *args.Length
+	}
+	if args.Attempts != nil {
+		attempts = *args.Attempts
+	}
+	if attempts < 0 {
+		return nil, fmt.Errorf("attempts must be nonnegative; 0 means unlimited")
+	}
+	word := ""
+	if args.Word != nil {
+		if !asciiGameWord(*args.Word) {
+			return nil, fmt.Errorf("word must contain only ASCII English letters")
 		}
-	}
-	return len(s) > 0
-}
-
-// startGame is the shared logic for starting a word guessing game
-func startGame(c *client.Client, sender string, args []string, gameType GameType) {
-	wordGuessingManager.mu.Lock()
-	defer wordGuessingManager.mu.Unlock()
-
-	gameName := "Wordle"
-	if gameType == GameTypeHangman {
-		gameName = "Hangman"
-	}
-
-	if wordGuessingManager.activeGame != nil {
-		activeGameName := "Wordle"
-		if wordGuessingManager.activeGame.Type == GameTypeHangman {
-			activeGameName = "Hangman"
+		word = strings.ToLower(*args.Word)
+		if args.Length != nil && length != len(word) {
+			return nil, fmt.Errorf("length must match the custom word length")
 		}
-		guessInfo := fmt.Sprintf("%d", len(wordGuessingManager.activeGame.Guesses))
-		if wordGuessingManager.activeGame.MaxGuesses > 0 {
-			guessInfo = fmt.Sprintf("%d/%d", len(wordGuessingManager.activeGame.Guesses), wordGuessingManager.activeGame.MaxGuesses)
-		}
-		c.SendChatMessage(fmt.Sprintf("%s in progress (%s guesses): %s",
-			activeGameName, guessInfo, wordGuessingManager.activeGame.GetProgressDisplay()))
-		return
+		length = len(word)
 	}
-
-	var word string
-	var maxAttempts int = 0 // 0 = infinite
-	var customWord bool = false
-
-	if len(args) == 0 {
-		// No args: random 5-letter word, infinite attempts
+	if length < 3 || length > 15 {
+		return nil, fmt.Errorf("word length must be between 3 and 15")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if m.active != nil {
+		return nil, fmt.Errorf("a shared %s game is already active; finish or stop it first", m.active.game)
+	}
+	if args.Word == nil {
 		var err error
-		word, err = fetchRandomWord(defaultWordLength)
+		word, err = randomGameWord(length)
 		if err != nil {
-			log.Printf("[%s] Failed to fetch word: %v", gameName, err)
-			c.SendChatMessage("Failed to start game. Please try again.")
-			return
+			return nil, err
 		}
-	} else if isNumeric(args[0]) {
-		// First arg is a number: it's the length
-		length, _ := strconv.Atoi(args[0])
-		if length < minWordLength || length > maxWordLength {
-			c.SendChatMessage(fmt.Sprintf("Word length must be between %d and %d", minWordLength, maxWordLength))
-			return
+	}
+	m.active = &wordGame{
+		game: args.Game, word: word, owner: actor, custom: args.Word != nil,
+		maxAttempts: attempts, seen: make(map[string]struct{}), revealed: make([]bool, length),
+	}
+	return m.active.snapshot("active"), nil
+}
+
+func (m *gameManager) guess(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
+	var args struct {
+		Guess string `json:"guess"`
+	}
+	if err := decodeArgs(raw, &args); err != nil {
+		return nil, err
+	}
+	if len(args.Guess) > 15 || !asciiGameWord(args.Guess) {
+		return nil, fmt.Errorf("guess must contain 1 to 15 ASCII English letters")
+	}
+	guess := strings.ToLower(args.Guess)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	g := m.active
+	if g == nil {
+		return nil, fmt.Errorf("no shared game is active")
+	}
+	if len(guess) != len(g.word) && (g.game != "hangman" || len(guess) != 1) {
+		if g.game == "hangman" {
+			return nil, fmt.Errorf("guess one letter or a %d-letter word", len(g.word))
 		}
-		var err error
-		word, err = fetchRandomWord(length)
-		if err != nil {
-			log.Printf("[%s] Failed to fetch word: %v", gameName, err)
-			c.SendChatMessage("Failed to start game. Please try again.")
-			return
-		}
-		// Check for second arg (attempts)
-		if len(args) > 1 && isNumeric(args[1]) {
-			maxAttempts, _ = strconv.Atoi(args[1])
-		}
-	} else if isValidWord(args[0]) {
-		// First arg is a word: use it as the custom word
-		word = args[0]
-		customWord = true
-		// Check for second arg (attempts)
-		if len(args) > 1 && isNumeric(args[1]) {
-			maxAttempts, _ = strconv.Atoi(args[1])
+		return nil, fmt.Errorf("guess a %d-letter word", len(g.word))
+	}
+	if _, exists := g.seen[guess]; exists {
+		return nil, fmt.Errorf("that guess was already played; no attempt was used")
+	}
+	g.seen[guess] = struct{}{}
+	g.guessCount++
+	entry := gameGuess{Player: actor, Guess: guess}
+	won := guess == g.word
+	if g.game == "wordle" {
+		g.attemptsUsed++
+		entry.Correct = won
+		entry.Letters = evaluateWordle(g.word, guess)
+		for i, result := range entry.Letters {
+			g.revealed[i] = result == "correct"
 		}
 	} else {
-		c.SendChatMessage(fmt.Sprintf("Usage: !%s [word|length] [attempts]", strings.ToLower(gameName)))
-		return
-	}
-
-	// Use rune length to properly handle Unicode characters
-	length := len([]rune(word))
-	if length < minWordLength || length > maxWordLength {
-		c.SendChatMessage(fmt.Sprintf("Word must be between %d and %d letters", minWordLength, maxWordLength))
-		return
-	}
-
-	// Create new game
-	wordGuessingManager.activeGame = &WordGuessingGame{
-		Type:         gameType,
-		Word:         strings.ToUpper(word),
-		Length:       length,
-		Guesses:      make([]string, 0),
-		Revealed:     make([]bool, length),
-		WrongGuesses: make([]string, 0),
-		MaxGuesses:   maxAttempts,
-		StartedBy:    sender,
-		StartTime:    time.Now(),
-		CustomWord:   customWord,
-	}
-
-	attemptsStr := "infinite"
-	if maxAttempts > 0 {
-		attemptsStr = fmt.Sprintf("%d", maxAttempts)
-	}
-
-	c.SendChatMessage(fmt.Sprintf("%s started by %s! Guess the %d-letter word (%s attempts): %s",
-		gameName, sender, length, attemptsStr, wordGuessingManager.activeGame.GetProgressDisplay()))
-}
-
-// wordleCommand handles the !wordle command
-func wordleCommand(c *client.Client, sender string, args []string) {
-	startGame(c, sender, args, GameTypeWordle)
-}
-
-// hangmanCommand handles the !hangman command
-func hangmanCommand(c *client.Client, sender string, args []string) {
-	startGame(c, sender, args, GameTypeHangman)
-}
-
-// StopWordle stops the current word guessing game
-// Returns (stopped, permissionDenied)
-func StopWordle(c *client.Client, sender string) (bool, bool) {
-	if wordGuessingManager == nil {
-		return false, false
-	}
-
-	wordGuessingManager.mu.Lock()
-	defer wordGuessingManager.mu.Unlock()
-
-	if wordGuessingManager.activeGame == nil {
-		return false, false
-	}
-
-	// Check if sender has permission to stop (same as permission to start: admin only)
-	if !HasRank(sender, "admin") {
-		return false, true
-	}
-
-	gameName := "Wordle"
-	if wordGuessingManager.activeGame.Type == GameTypeHangman {
-		gameName = "Hangman"
-	}
-
-	word := wordGuessingManager.activeGame.Word
-	wordGuessingManager.activeGame = nil
-	c.SendChatMessage(fmt.Sprintf("%s stopped. The word was: %s", gameName, word))
-	return true, false
-}
-
-// ProcessGuess checks if a message is a valid guess and processes it
-// Returns true if the message was processed as a guess
-func ProcessGuess(c *client.Client, sender, message string) bool {
-	if wordGuessingManager == nil {
-		return false
-	}
-
-	wordGuessingManager.mu.Lock()
-	defer wordGuessingManager.mu.Unlock()
-
-	if wordGuessingManager.activeGame == nil {
-		return false
-	}
-
-	game := wordGuessingManager.activeGame
-
-	if game.Type == GameTypeHangman {
-		return processHangmanGuess(c, sender, message, game)
-	}
-	return processWordleGuess(c, sender, message, game)
-}
-
-// processWordleGuess handles wordle-style guesses (full words)
-func processWordleGuess(c *client.Client, sender, message string, game *WordGuessingGame) bool {
-	// Check if message is the right length and all letters
-	message = strings.TrimSpace(message)
-	messageRunes := []rune(message)
-
-	if len(messageRunes) != game.Length {
-		return false
-	}
-
-	// Check if all characters are letters
-	for _, r := range messageRunes {
-		if !unicode.IsLetter(r) {
-			return false
-		}
-	}
-
-	guess := strings.ToUpper(message)
-
-	// Check if already guessed
-	for _, g := range game.Guesses {
-		if g == guess {
-			c.SendChatMessage(fmt.Sprintf("%s: Already guessed!", guess))
-			return true
-		}
-	}
-
-	// Add guess
-	game.Guesses = append(game.Guesses, guess)
-
-	// Check for exact match
-	if guess == game.Word {
-		// Only award points for non-custom words
-		if !game.CustomWord {
-			AddGamePoint(sender, "wordle")
-			points := GetGamePoints(sender, "wordle")
-			c.SendChatMessage(fmt.Sprintf("Correct! %s guessed %s in %d guesses! (Wordle points: %d)", sender, game.Word, len(game.Guesses), points))
+		if len(guess) == 1 {
+			for i := range len(g.word) {
+				if g.word[i] == guess[0] {
+					g.revealed[i] = true
+					entry.Correct = true
+				}
+			}
+			won = true
+			for _, revealed := range g.revealed {
+				won = won && revealed
+			}
 		} else {
-			c.SendChatMessage(fmt.Sprintf("Correct! %s guessed %s in %d guesses!", sender, game.Word, len(game.Guesses)))
-		}
-		wordGuessingManager.activeGame = nil
-		return true
-	}
-
-	// Update revealed letters and build result
-	result := game.ProcessWordleGuessAndReveal(guess)
-
-	// Check for game over (only if MaxGuesses > 0)
-	if game.MaxGuesses > 0 && len(game.Guesses) >= game.MaxGuesses {
-		c.SendChatMessage(fmt.Sprintf("%s: %s | Game over! The word was: %s", sender, result, game.Word))
-		wordGuessingManager.activeGame = nil
-		return true
-	}
-
-	// Show progress
-	guessInfo := fmt.Sprintf("%d", len(game.Guesses))
-	if game.MaxGuesses > 0 {
-		guessInfo = fmt.Sprintf("%d/%d", len(game.Guesses), game.MaxGuesses)
-	}
-	c.SendChatMessage(fmt.Sprintf("%s: %s (%s) %s", sender, result, guessInfo, game.GetProgressDisplay()))
-
-	return true
-}
-
-// processHangmanGuess handles hangman-style guesses (single letters)
-func processHangmanGuess(c *client.Client, sender, message string, game *WordGuessingGame) bool {
-	message = strings.TrimSpace(message)
-	messageRunes := []rune(message)
-
-	// Only accept single letter guesses
-	if len(messageRunes) != 1 {
-		return false
-	}
-
-	r := messageRunes[0]
-	if !unicode.IsLetter(r) {
-		return false
-	}
-
-	guess := strings.ToUpper(string(r))
-
-	// Check if already guessed
-	for _, g := range game.Guesses {
-		if g == guess {
-			c.SendChatMessage(fmt.Sprintf("%s: Already guessed '%s'!", sender, guess))
-			return true
-		}
-	}
-
-	// Add guess
-	game.Guesses = append(game.Guesses, guess)
-
-	// Check if letter is in word
-	wordRunes := []rune(game.Word)
-	found := false
-	allRevealed := true
-
-	for i, wr := range wordRunes {
-		if strings.ToUpper(string(wr)) == guess {
-			game.Revealed[i] = true
-			found = true
-		}
-		if !game.Revealed[i] {
-			allRevealed = false
-		}
-	}
-
-	if !found {
-		game.WrongGuesses = append(game.WrongGuesses, guess)
-	}
-
-	// Check for win
-	if allRevealed {
-		// Only award points for non-custom words
-		if !game.CustomWord {
-			AddGamePoint(sender, "hangman")
-			points := GetGamePoints(sender, "hangman")
-			c.SendChatMessage(fmt.Sprintf("Correct! %s completed %s! Wrong guesses: %d (Hangman points: %d)",
-				sender, game.Word, len(game.WrongGuesses), points))
-		} else {
-			c.SendChatMessage(fmt.Sprintf("Correct! %s completed %s! Wrong guesses: %d",
-				sender, game.Word, len(game.WrongGuesses)))
-		}
-		wordGuessingManager.activeGame = nil
-		return true
-	}
-
-	// Check for game over (only if MaxGuesses > 0, based on wrong guesses)
-	if game.MaxGuesses > 0 && len(game.WrongGuesses) >= game.MaxGuesses {
-		c.SendChatMessage(fmt.Sprintf("Game over! The word was: %s", game.Word))
-		wordGuessingManager.activeGame = nil
-		return true
-	}
-
-	// Show progress
-	wrongInfo := ""
-	if len(game.WrongGuesses) > 0 {
-		if game.MaxGuesses > 0 {
-			wrongInfo = fmt.Sprintf(" | Wrong (%d/%d): %s", len(game.WrongGuesses), game.MaxGuesses, strings.Join(game.WrongGuesses, ","))
-		} else {
-			wrongInfo = fmt.Sprintf(" | Wrong: %s", strings.Join(game.WrongGuesses, ","))
-		}
-	}
-
-	if found {
-		c.SendChatMessage(fmt.Sprintf("%s: '%s' is in the word! %s%s", sender, guess, game.GetProgressDisplay(), wrongInfo))
-	} else {
-		c.SendChatMessage(fmt.Sprintf("%s: '%s' is not in the word. %s%s", sender, guess, game.GetProgressDisplay(), wrongInfo))
-	}
-
-	return true
-}
-
-// ProcessWordleGuessAndReveal processes a wordle guess and updates revealed letters
-// Returns a simple result string like "H.LL*" where:
-// uppercase = correct position, lowercase = wrong position, . = not in word
-func (g *WordGuessingGame) ProcessWordleGuessAndReveal(guess string) string {
-	var result strings.Builder
-	wordRunes := []rune(g.Word)
-	guessRunes := []rune(guess)
-	wordLetterCount := make(map[rune]int)
-
-	// Count letters in word
-	for _, r := range wordRunes {
-		wordLetterCount[r]++
-	}
-
-	// First pass: mark exact matches
-	exactMatch := make([]bool, g.Length)
-	for i := 0; i < g.Length; i++ {
-		if guessRunes[i] == wordRunes[i] {
-			exactMatch[i] = true
-			wordLetterCount[guessRunes[i]]--
-			g.Revealed[i] = true
-		}
-	}
-
-	// Second pass: build result
-	for i := 0; i < g.Length; i++ {
-		letter := guessRunes[i]
-		if exactMatch[i] {
-			// Exact match: uppercase
-			result.WriteRune(unicode.ToUpper(letter))
-		} else if wordLetterCount[letter] > 0 {
-			// Letter exists elsewhere: lowercase
-			wordLetterCount[letter]--
-			result.WriteRune(unicode.ToLower(letter))
-		} else {
-			// Not in word: dot
-			result.WriteRune('.')
-		}
-	}
-
-	return result.String()
-}
-
-// GetProgressDisplay returns the current progress display
-func (g *WordGuessingGame) GetProgressDisplay() string {
-	var result strings.Builder
-	result.WriteString("[")
-
-	wordRunes := []rune(g.Word)
-	for i := 0; i < g.Length; i++ {
-		if g.Revealed[i] {
-			result.WriteString(string(wordRunes[i]))
-		} else {
-			result.WriteString("_")
-		}
-	}
-
-	result.WriteString("]")
-	return result.String()
-}
-
-// fetchRandomWord fetches a random word of the specified length
-func fetchRandomWord(length int) (string, error) {
-	// Try the random word API first
-	url := fmt.Sprintf("https://random-word-api.herokuapp.com/word?length=%d", length)
-
-	httpClient := &http.Client{Timeout: 5 * time.Second}
-	resp, err := httpClient.Get(url)
-	if err == nil && resp.StatusCode == http.StatusOK {
-		defer resp.Body.Close()
-		body, err := io.ReadAll(resp.Body)
-		if err == nil {
-			var words []string
-			if err := json.Unmarshal(body, &words); err == nil && len(words) > 0 {
-				return strings.ToLower(words[0]), nil
+			entry.Correct = won
+			if won {
+				for i := range g.revealed {
+					g.revealed[i] = true
+				}
 			}
 		}
-	}
-
-	// Fallback to built-in word list
-	log.Printf("[WordGuessing] API failed, using fallback word list")
-	return getRandomFallbackWord(length)
-}
-
-// Fallback word lists by length
-var fallbackWords = map[int][]string{
-	3:  {"cat", "dog", "sun", "run", "fun", "hat", "bat", "car", "jar", "bar"},
-	4:  {"word", "game", "play", "time", "love", "home", "book", "tree", "star", "moon"},
-	5:  {"world", "games", "words", "music", "happy", "party", "money", "water", "light", "dream"},
-	6:  {"friend", "family", "player", "garden", "castle", "dragon", "knight", "wizard", "forest", "planet"},
-	7:  {"another", "morning", "evening", "weather", "journey", "mystery", "fantasy", "kingdom", "diamond", "rainbow"},
-	8:  {"computer", "building", "mountain", "treasure", "champion", "surprise", "strength", "football", "birthday", "shopping"},
-	9:  {"adventure", "beautiful", "challenge", "dangerous", "excellent", "fantastic", "happiness", "important", "knowledge", "wonderful"},
-	10: {"basketball", "absolutely", "background", "celebrated", "determined", "everything", "friendship", "generation", "helicopter", "impossible"},
-}
-
-func getRandomFallbackWord(length int) (string, error) {
-	words, ok := fallbackWords[length]
-	if !ok || len(words) == 0 {
-		// Generate a simple word if no fallback exists
-		return generateSimpleWord(length), nil
-	}
-	return words[rand.Intn(len(words))], nil
-}
-
-// generateSimpleWord generates a simple pronounceable word
-func generateSimpleWord(length int) string {
-	vowels := []rune{'a', 'e', 'i', 'o', 'u'}
-	consonants := []rune{'b', 'c', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'm', 'n', 'p', 'r', 's', 't', 'v', 'w'}
-
-	result := make([]rune, length)
-	for i := range length {
-		if i%2 == 0 {
-			result[i] = consonants[rand.Intn(len(consonants))]
-		} else {
-			result[i] = vowels[rand.Intn(len(vowels))]
+		if !entry.Correct {
+			g.attemptsUsed++
 		}
 	}
-	return string(result)
+	if len(g.recent) == gameHistoryLimit {
+		copy(g.recent, g.recent[1:])
+		g.recent[len(g.recent)-1] = entry
+	} else {
+		g.recent = append(g.recent, entry)
+	}
+	if won {
+		result := g.snapshot("won")
+		result.Winner = actor
+		if !g.custom {
+			points := m.store.addPoint(actor, g.game)
+			result.PointsAwarded = 1
+			result.WinnerPoints = &points
+		}
+		m.active = nil
+		return result, nil
+	}
+	if g.maxAttempts > 0 && g.attemptsUsed >= g.maxAttempts {
+		result := g.snapshot("lost")
+		m.active = nil
+		return result, nil
+	}
+	return g.snapshot("active"), nil
+}
+
+func (m *gameManager) status(ctx context.Context, _ string, raw json.RawMessage) (any, error) {
+	if err := decodeArgs(raw, &struct{}{}); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if m.active == nil {
+		return gameResult{Status: "none", Cooperative: true}, nil
+	}
+	return m.active.snapshot("active"), nil
+}
+
+func (m *gameManager) stop(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
+	if err := decodeArgs(raw, &struct{}{}); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if m.active == nil {
+		return nil, fmt.Errorf("no shared game is active")
+	}
+	if !strings.EqualFold(actor, m.active.owner) && !m.store.hasRank(actor, "admin") {
+		return nil, fmt.Errorf("only the game's owner or an administrator may stop it")
+	}
+	result := m.active.snapshot("stopped")
+	m.active = nil
+	return result, nil
+}
+
+func (g *wordGame) snapshot(status string) gameResult {
+	progress := make([]byte, len(g.word))
+	for i := range progress {
+		progress[i] = '_'
+		if g.revealed[i] {
+			progress[i] = g.word[i]
+		}
+	}
+	result := gameResult{
+		Status: status, Cooperative: true, Game: g.game, Owner: g.owner,
+		Length: len(g.word), CustomWord: g.custom, Progress: string(progress),
+		MaxAttempts: g.maxAttempts, Unlimited: g.maxAttempts == 0,
+		AttemptsUsed: g.attemptsUsed, GuessCount: g.guessCount,
+		RecentGuesses: append([]gameGuess(nil), g.recent...),
+	}
+	if g.maxAttempts > 0 {
+		remaining := g.maxAttempts - g.attemptsUsed
+		result.RemainingAttempts = &remaining
+	}
+	if status == "won" || status == "lost" || status == "stopped" {
+		result.Answer = g.word
+	}
+	return result
+}
+
+func asciiGameWord(word string) bool {
+	if word == "" {
+		return false
+	}
+	for i := range len(word) {
+		c := word[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+			return false
+		}
+	}
+	return true
+}
+
+// Exact matches consume letters first, so an extra duplicate cannot steal a
+// present mark from an exact match later in the word.
+func evaluateWordle(word, guess string) []string {
+	result := make([]string, len(word))
+	var remaining [26]int
+	for i := range len(word) {
+		if word[i] == guess[i] {
+			result[i] = "correct"
+		} else {
+			remaining[word[i]-'a']++
+		}
+	}
+	for i := range len(word) {
+		if result[i] == "correct" {
+			continue
+		}
+		letter := guess[i] - 'a'
+		if remaining[letter] > 0 {
+			result[i] = "present"
+			remaining[letter]--
+		} else {
+			result[i] = "absent"
+		}
+	}
+	return result
+}
+
+func randomGameWord(length int) (string, error) {
+	var words []string
+	switch length {
+	case 3:
+		words = []string{"cat", "dog", "sun", "run", "fun", "hat", "bat", "car", "jar", "bar"}
+	case 4:
+		words = []string{"word", "game", "play", "time", "love", "home", "book", "tree", "star", "moon"}
+	case 5:
+		words = []string{"world", "games", "words", "music", "happy", "party", "money", "water", "light", "dream"}
+	case 6:
+		words = []string{"friend", "family", "player", "garden", "castle", "dragon", "knight", "wizard", "forest", "planet"}
+	case 7:
+		words = []string{"another", "morning", "evening", "weather", "journey", "mystery", "fantasy", "kingdom", "diamond", "rainbow"}
+	case 8:
+		words = []string{"computer", "building", "mountain", "treasure", "champion", "surprise", "strength", "football", "birthday", "shopping"}
+	case 9:
+		words = []string{"adventure", "beautiful", "challenge", "dangerous", "excellent", "fantastic", "happiness", "important", "knowledge", "wonderful"}
+	case 10:
+		words = []string{"basketball", "absolutely", "background", "celebrated", "determined", "everything", "friendship", "generation", "helicopter", "impossible"}
+	case 11:
+		words = []string{"celebration", "imagination", "information", "development", "countryside", "personality"}
+	case 12:
+		words = []string{"appreciation", "construction", "conversation", "intelligence", "relationship", "thunderstorm"}
+	case 13:
+		words = []string{"communication", "understanding", "entertainment", "determination", "extraordinary"}
+	case 14:
+		words = []string{"responsibility", "administration", "transportation", "identification", "recommendation"}
+	case 15:
+		words = []string{"congratulations", "characteristics", "representatives", "instrumentation", "experimentation"}
+	default:
+		return "", fmt.Errorf("word length must be between 3 and 15")
+	}
+	return words[rand.IntN(len(words))], nil
 }

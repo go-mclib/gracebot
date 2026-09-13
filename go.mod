@@ -3,14 +3,13 @@ module github.com/go-mclib/gracebot
 go 1.25.0
 
 require (
-	github.com/go-mclib/client v0.0.0-20251215171254-8d53549a90f7
-	github.com/go-mclib/data v0.0.0-20251215170733-d4d5987ba9e9
-	github.com/go-mclib/protocol v0.0.0-20251201083925-8d7afa267830
+	github.com/go-mclib/client v0.0.0-20260721202742-264f5889c4f2
+	github.com/go-mclib/data v0.0.0-20260722192314-0d43e705864e
+	github.com/go-mclib/protocol v0.0.0-20260721202818-10261fbb8e79
 	github.com/sashabaranov/go-openai v1.41.2
 )
 
 require (
-	github.com/Tnze/go-mc v1.20.2 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/charmbracelet/bubbles v0.21.0 // indirect
@@ -24,6 +23,7 @@ require (
 	github.com/clipperhouse/stringish v0.1.1 // indirect
 	github.com/clipperhouse/uax29/v2 v2.3.0 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
+	github.com/go-mclib/nbt v0.0.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-localereader v0.0.1 // indirect
@@ -37,3 +37,6 @@ require (
 	golang.org/x/sys v0.39.0 // indirect
 	golang.org/x/text v0.32.0 // indirect
 )
+
+// NBT is an unpublished module provided by the go-mclib workspace.
+replace github.com/go-mclib/nbt => ../nbt

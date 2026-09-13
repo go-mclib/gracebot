@@ -1,106 +1,235 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
-	"regexp"
 	"strings"
+	"sync"
+	"time"
+	"unicode"
+	"unicode/utf8"
 
-	"github.com/go-mclib/client/client"
-	packets "github.com/go-mclib/data/go/773/java_packets"
+	"github.com/go-mclib/client"
+	chatmodule "github.com/go-mclib/client/modules/chat"
+	"github.com/go-mclib/client/modules/playerlist"
+	"github.com/go-mclib/data/packet_ids"
+	"github.com/go-mclib/data/packets"
 	jp "github.com/go-mclib/protocol/java_protocol"
 )
 
-// deathMessageRegex matches death messages like "death.attack.outOfWorld [HIPPO84]"
-var deathMessageRegex = regexp.MustCompile(`^(death\.[a-zA-Z._]+) \[([^\]]+)\]`)
-
-var llmManager *LLMManager
-var conversationEnabled bool
-
-// initChatHandlers initializes the chat handlers with the LLM manager
-// manager can be nil if conversation mode is disabled
-func initChatHandlers(manager *LLMManager) {
-	llmManager = manager
-	conversationEnabled = manager != nil
-}
-
-func graceChatHandler(c *client.Client, pkt *jp.Packet) {
-	// handle player chat messages
-	if pkt.PacketID == packets.S2CPlayerChat.PacketID {
-		var d packets.S2CPlayerChatData
-		if err := jp.BytesToPacketData(pkt.Data, &d); err == nil {
-			sender := d.SenderName.GetText()
-			if sender == c.Username {
-				return
-			}
-
-			message := string(d.Message)
-			if sender != "" && message != "" {
-				// Track player activity and word counts
-				UpdatePlayerActivity(sender)
-				CountWords(sender, message)
-
-				// Mode 1: Command handling (always active, ! prefix)
-				if HandleCommand(c, sender, message) {
-					return
-				}
-
-				// Check for wordle guesses (if game is active)
-				if ProcessGuess(c, sender, message) {
-					return
-				}
-
-				// Mode 2: Conversation mode (if enabled)
-				if conversationEnabled && llmManager != nil {
-					llmManager.AddMessage(sender, message, false)
-				}
-			}
+func parseAliases(value string) []string {
+	var aliases []string
+	seen := make(map[string]bool)
+	for _, alias := range strings.Split(value, ",") {
+		alias = strings.ToLower(strings.TrimSpace(alias))
+		if alias != "" && !seen[alias] {
+			aliases = append(aliases, alias)
+			seen[alias] = true
 		}
 	}
-
-	// handle system chat messages (join/leave/death etc.)
-	if pkt.PacketID == packets.S2CSystemChat.PacketID {
-		var d packets.S2CSystemChatData
-		if err := jp.BytesToPacketData(pkt.Data, &d); err == nil {
-			content := d.Content.GetText()
-			// check for chat chain broken - triggers reconnect
-			if strings.Contains(content, "chat.disabled.chain_broken") {
-				log.Printf("Chat chain broken detected - triggering reconnect")
-				go func() {
-					if err := c.Disconnect(false); err != nil {
-						log.Printf("Failed to disconnect for reconnect: %v", err)
-					}
-				}()
-				return
-			}
-
-			// Check for death messages
-			if matches := deathMessageRegex.FindStringSubmatch(content); matches != nil {
-				player := matches[2]
-				deathType := matches[1]
-				AddDeath(player, deathType)
-			}
-
-			if content != "" && !shouldFilterMessage(content) {
-				// Only forward system messages to LLM if conversation mode is enabled
-				if conversationEnabled && llmManager != nil {
-					llmManager.AddMessage("", content, true)
-				}
-			}
-		}
-	}
+	return aliases
 }
 
-// shouldFilterMessage checks if a message should be filtered out
-func shouldFilterMessage(message string) bool {
-	filterKeywords := []string{
-		"You received:",
-		"Donate",
-		"multiplayer.player.joined [GraceBot]",
+func mentioned(message, username string, aliases []string) bool {
+	message = strings.ToLower(message)
+	if username != "" && strings.Contains(message, strings.ToLower(username)) {
+		return true
 	}
-	for _, keyword := range filterKeywords {
-		if strings.Contains(message, keyword) {
+	for _, alias := range aliases {
+		if alias != "" && strings.Contains(message, alias) {
 			return true
 		}
 	}
 	return false
+}
+
+type chatRouter struct {
+	assistant *assistant
+	store     *playerStore
+	aliases   []string
+}
+
+func (r *chatRouter) playerChat(ctx context.Context, username, sender, message string) {
+	if ctx.Err() != nil || sender == "" || strings.EqualFold(sender, username) || strings.TrimSpace(message) == "" {
+		return
+	}
+	r.store.recordChat(sender, message, time.Now())
+	if !mentioned(message, username, r.aliases) {
+		return
+	}
+	request := chatRequest{sender: sender, message: message, username: username, ctx: ctx}
+	select {
+	case r.assistant.requests <- request:
+	case <-ctx.Done():
+	default:
+		// Bound backpressure so overload cannot indefinitely stall keepalives.
+		replyCtx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		if err := r.assistant.send(replyCtx, sender+": I'm busy; please mention me again shortly."); err != nil {
+			log.Printf("chat queue full; busy reply for %s failed: %v", sender, err)
+		}
+	}
+}
+
+func (r *chatRouter) handler(ctx context.Context, players *playerlist.Module) client.Handler {
+	return func(c *client.Client, wire *jp.WirePacket) {
+		if c.State() != jp.StatePlay {
+			return
+		}
+		switch wire.PacketID {
+		case packet_ids.S2CPlayerChatID:
+			var packet packets.S2CPlayerChat
+			if err := wire.ReadInto(&packet); err != nil {
+				log.Printf("decode player chat: %v", err)
+				return
+			}
+			// The signed sender UUID resolves to the profile name. Display names
+			// are decorative and must never be used for tool authorization.
+			player := players.GetPlayer([16]byte(packet.Sender))
+			if player == nil {
+				log.Printf("ignoring chat from unknown player UUID %s", packet.Sender)
+				return
+			}
+			if packet.FilterMask.Type != packets.FilterMaskPassThrough {
+				return
+			}
+			r.playerChat(ctx, c.Username, player.Name, string(packet.Body.Content))
+		case packet_ids.S2CSystemChatID:
+			var packet packets.S2CSystemChat
+			if err := wire.ReadInto(&packet); err != nil {
+				log.Printf("decode system chat: %v", err)
+				return
+			}
+			if !bool(packet.Overlay) && strings.HasPrefix(packet.Content.Translate, "death.") && len(packet.Content.With) > 0 {
+				r.store.recordDeath(packet.Content.With[0].String(), packet.Content.Translate)
+			}
+			// System, disguised and overlay messages never invoke the AI, even
+			// if their rendered text contains a bot name or forged player name.
+		}
+	}
+}
+
+// Upstream chat signing/acknowledgement state is shared by reads and writes.
+// Serialize access while the AI and lyrics run outside the packet loop.
+type synchronizedChat struct {
+	inner *chatmodule.Module
+	ctx   context.Context
+	mu    sync.Mutex
+	ready bool
+}
+
+func (m *synchronizedChat) Name() string          { return m.inner.Name() }
+func (m *synchronizedChat) Init(c *client.Client) { m.inner.Init(c) }
+func (m *synchronizedChat) Reset() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ready = false
+	m.inner.Reset()
+}
+func (m *synchronizedChat) HandlePacket(packet *jp.WirePacket) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.inner.HandlePacket(packet)
+}
+func (m *synchronizedChat) SendMessage(message string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.ready || m.ctx.Err() != nil {
+		return fmt.Errorf("Minecraft chat is disconnected")
+	}
+	return m.inner.SendMessage(message)
+}
+func (m *synchronizedChat) SendCommand(command string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.ready || m.ctx.Err() != nil {
+		return fmt.Errorf("Minecraft chat is disconnected")
+	}
+	return m.inner.SendCommand(command)
+}
+func (m *synchronizedChat) SendChatSessionData() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.inner.SendChatSessionData()
+}
+
+// One output path enforces the client's byte limit, valid UTF-8 and pacing.
+type chatOutput struct {
+	gate     chan struct{}
+	mu       sync.RWMutex
+	write    func(string) error
+	last     time.Time
+	interval time.Duration
+}
+
+func newChatOutput() *chatOutput {
+	return &chatOutput{gate: make(chan struct{}, 1), interval: time.Second}
+}
+func (o *chatOutput) bind(write func(string) error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.write = write
+}
+func (o *chatOutput) send(ctx context.Context, text string) error {
+	select {
+	case o.gate <- struct{}{}:
+		defer func() { <-o.gate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	for _, chunk := range chatChunks(text) {
+		if delay := time.Until(o.last.Add(o.interval)); delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		o.mu.RLock()
+		write := o.write
+		o.mu.RUnlock()
+		if write == nil {
+			return fmt.Errorf("Minecraft chat is disconnected")
+		}
+		if err := write(chunk); err != nil {
+			return err
+		}
+		o.last = time.Now()
+	}
+	return nil
+}
+
+func chatChunks(text string) []string {
+	text = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return ' '
+		}
+		if unicode.IsControl(r) || r == '§' || r == utf8.RuneError {
+			return -1
+		}
+		return r
+	}, text)
+	text = strings.TrimSpace(text)
+	var chunks []string
+	for len(text) > 256 {
+		end := 256
+		for !utf8.RuneStart(text[end]) {
+			end--
+		}
+		if space := strings.LastIndexByte(text[:end], ' '); space > end/2 {
+			end = space
+		}
+		chunks = append(chunks, text[:end])
+		text = strings.TrimSpace(text[end:])
+	}
+	if text != "" {
+		chunks = append(chunks, text)
+	}
+	return chunks
 }

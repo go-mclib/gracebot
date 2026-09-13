@@ -1,327 +1,276 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"net/url"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
-
-	"github.com/go-mclib/client/client"
 )
 
-// LyricLine represents a single line of lyrics with timestamp
-type LyricLine struct {
-	Time time.Duration
-	Text string
+type lyricLine struct {
+	at   time.Duration
+	text string
 }
 
-// SingSession represents an active singing session
-type SingSession struct {
-	Track     string
-	Artist    string
-	Lyrics    []LyricLine
-	StartAt   time.Time
-	StartedBy string
-	StopChan  chan struct{}
+type songState struct {
+	State  string `json:"state"`
+	Owner  string `json:"owner,omitempty"`
+	Track  string `json:"track,omitempty"`
+	Artist string `json:"artist,omitempty"`
+	Synced bool   `json:"synced"`
+	Error  string `json:"error,omitempty"`
 }
 
-// SingManager manages singing sessions
-type SingManager struct {
-	activeSession *SingSession
-	mu            sync.Mutex
+type songSession struct {
+	state  songState // Protected by activities.mu.
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
-// Global sing manager
-var singManager = &SingManager{}
-
-func init() {
-	RegisterCommand("sing", "Sing lyrics of a song", "!sing <song name>", []string{"admin", "trusted"}, singCommand)
-}
-
-// lrcLibResponse represents the response from lrclib.net API
-type lrcLibResponse struct {
-	ID           int     `json:"id"`
-	TrackName    string  `json:"trackName"`
-	ArtistName   string  `json:"artistName"`
-	AlbumName    string  `json:"albumName"`
-	Duration     float64 `json:"duration"`
-	SyncedLyrics string  `json:"syncedLyrics"`
-	PlainLyrics  string  `json:"plainLyrics"`
-}
-
-// singCommand handles the !sing command
-func singCommand(c *client.Client, sender string, args []string) {
-	if len(args) == 0 {
-		c.SendChatMessage("Usage: !sing <song name>")
-		return
+func (a *activities) sing(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
+	var args struct {
+		Query string `json:"query"`
 	}
-
-	query := strings.Join(args, " ")
-
-	singManager.mu.Lock()
-	if singManager.activeSession != nil {
-		singManager.mu.Unlock()
-		c.SendChatMessage("Already singing! Use !stop to stop.")
-		return
+	if err := decodeArgs(raw, &args); err != nil {
+		return nil, err
 	}
-	singManager.mu.Unlock()
+	if !a.store.hasRank(actor, "admin") && !a.store.hasRank(actor, "trusted") {
+		return nil, fmt.Errorf("only an admin or trusted player may start singing")
+	}
+	query := strings.TrimSpace(args.Query)
+	if query == "" || len(query) > 500 {
+		return nil, fmt.Errorf("provide a song title and optional artist of at most 500 bytes")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return nil, fmt.Errorf("activities are closed")
+	}
+	if a.song != nil {
+		a.mu.Unlock()
+		return nil, fmt.Errorf("a song is already loading or playing; stop it first")
+	}
+	songCtx, cancel := context.WithCancel(a.ctx)
+	session := &songSession{state: songState{State: "loading", Owner: actor}, ctx: songCtx, cancel: cancel, done: make(chan struct{})}
+	a.song = session
+	// Reservation and Add are atomic with close's closed check and Wait.
+	a.wg.Add(1)
+	a.mu.Unlock()
 
-	// Fetch lyrics
-	c.SendChatMessage(fmt.Sprintf("Searching for: %s...", query))
-
-	lyrics, track, artist, err := fetchLyrics(query)
+	// The initiating request cancels the search, but not successful background playback.
+	stopRequestCancel := context.AfterFunc(ctx, cancel)
+	lyrics, track, artist, synced, err := a.fetchLyrics(songCtx, query)
+	stopRequestCancel()
+	if err == nil {
+		err = ctx.Err()
+	}
+	if err == nil {
+		err = songCtx.Err()
+	}
 	if err != nil {
-		log.Printf("[Sing] Failed to fetch lyrics: %v", err)
-		c.SendChatMessage("Could not find lyrics for that song.")
-		return
+		a.finishSong(session, err)
+		return nil, err
 	}
-
-	if len(lyrics) == 0 {
-		c.SendChatMessage("No synced lyrics available for this song.")
-		return
+	a.mu.Lock()
+	if err := songCtx.Err(); err != nil {
+		a.mu.Unlock()
+		a.finishSong(session, err)
+		return nil, err
 	}
-
-	singManager.mu.Lock()
-	singManager.activeSession = &SingSession{
-		Track:     track,
-		Artist:    artist,
-		Lyrics:    lyrics,
-		StartedBy: sender,
-		StopChan:  make(chan struct{}),
-	}
-	session := singManager.activeSession
-	singManager.mu.Unlock()
-
-	c.SendChatMessage(fmt.Sprintf("Now singing: %s - %s", artist, track))
-
-	// Start singing in background with countdown
-	go singManager.playSongWithCountdown(c, session)
+	session.state.Track = track
+	session.state.Artist = artist
+	session.state.Synced = synced
+	session.state.State = "playing"
+	state := session.state
+	a.mu.Unlock()
+	go func() { a.finishSong(session, a.playSong(session.ctx, lyrics)) }()
+	return state, nil
 }
 
-// playSongWithCountdown does a 3-2-1 countdown then plays the song
-func (m *SingManager) playSongWithCountdown(c *client.Client, session *SingSession) {
-	// Countdown from 3
-	for i := 3; i >= 1; i-- {
-		select {
-		case <-session.StopChan:
-			c.SendChatMessage("Stopped singing.")
-			m.mu.Lock()
-			m.activeSession = nil
-			m.mu.Unlock()
-			return
-		default:
+func (a *activities) stopSinging(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
+	if err := decodeArgs(raw, &struct{}{}); err != nil {
+		return nil, err
+	}
+	admin := a.store.hasRank(actor, "admin")
+	a.mu.Lock()
+	session := a.song
+	if session == nil {
+		a.mu.Unlock()
+		return map[string]any{"state": "idle", "stopped": false}, nil
+	}
+	if !strings.EqualFold(actor, session.state.Owner) && !admin {
+		a.mu.Unlock()
+		return nil, fmt.Errorf("only the song's owner or an admin may stop singing")
+	}
+	session.cancel()
+	a.mu.Unlock()
+	// Wait outside the lock so no old lyrics can leak into a replacement song.
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-session.done:
+		a.mu.Lock()
+		state := session.state
+		a.mu.Unlock()
+		return state, nil
+	}
+}
+
+func (a *activities) singingStatus(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
+	if err := decodeArgs(raw, &struct{}{}); err != nil {
+		return nil, err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.song != nil {
+		return a.song.state, nil
+	}
+	if a.lastSong.State == "" {
+		return songState{State: "idle"}, nil
+	}
+	return a.lastSong, nil
+}
+
+func (a *activities) finishSong(session *songSession, err error) {
+	a.mu.Lock()
+	switch {
+	case session.ctx.Err() != nil:
+		session.state.State = "stopped"
+	case err != nil:
+		session.state.State = "failed"
+		session.state.Error = err.Error()
+	default:
+		session.state.State = "finished"
+	}
+	a.lastSong = session.state
+	if a.song == session {
+		a.song = nil
+	}
+	a.mu.Unlock()
+	if err != nil && session.ctx.Err() == nil {
+		log.Printf("Singing failed: %v", err)
+	}
+	session.cancel()
+	close(session.done)
+	a.wg.Done()
+}
+
+func (a *activities) playSong(ctx context.Context, lyrics []lyricLine) error {
+	start := time.Now()
+	for _, line := range lyrics {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		c.SendChatMessage(fmt.Sprintf("%d...", i))
-		time.Sleep(1 * time.Second)
-	}
-
-	// Set the start time after countdown
-	session.StartAt = time.Now()
-	m.playSong(c, session)
-}
-
-// playSong plays the lyrics synchronized
-func (m *SingManager) playSong(c *client.Client, session *SingSession) {
-	startTime := session.StartAt
-
-	for _, line := range session.Lyrics {
-		// Calculate when this line should be sent
-		targetTime := startTime.Add(line.Time)
-		waitDuration := time.Until(targetTime)
-
-		if waitDuration > 0 {
+		if delay := time.Until(start.Add(line.at)); delay > 0 {
+			timer := time.NewTimer(delay)
 			select {
-			case <-session.StopChan:
-				c.SendChatMessage("Stopped singing.")
-				m.mu.Lock()
-				m.activeSession = nil
-				m.mu.Unlock()
-				return
-			case <-time.After(waitDuration):
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
 			}
 		}
-
-		// Check if stopped
-		select {
-		case <-session.StopChan:
-			c.SendChatMessage("Stopped singing.")
-			m.mu.Lock()
-			m.activeSession = nil
-			m.mu.Unlock()
-			return
-		default:
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-
-		// Send the lyric line
-		if line.Text != "" {
-			c.SendChatMessage(line.Text)
+		if err := a.send(ctx, line.text); err != nil {
+			return fmt.Errorf("send lyrics: %w", err)
 		}
 	}
-
-	// Song finished
-	m.mu.Lock()
-	m.activeSession = nil
-	m.mu.Unlock()
+	return nil
 }
 
-// StopSinging stops the current singing session
-// Returns (stopped, permissionDenied)
-func StopSinging(sender string) (bool, bool) {
-	if singManager == nil {
-		return false, false
+func (a *activities) fetchLyrics(ctx context.Context, query string) ([]lyricLine, string, string, bool, error) {
+	var tracks []struct {
+		Track  string `json:"trackName"`
+		Artist string `json:"artistName"`
+		Synced string `json:"syncedLyrics"`
+		Plain  string `json:"plainLyrics"`
 	}
-
-	singManager.mu.Lock()
-	defer singManager.mu.Unlock()
-
-	if singManager.activeSession == nil {
-		return false, false
+	if err := a.getJSON(ctx, "https://lrclib.net/api/search?q="+url.QueryEscape(query), &tracks); err != nil {
+		return nil, "", "", false, err
 	}
-
-	// Check if sender has permission to stop (same as permission to start: admin or trusted)
-	if !HasRank(sender, "admin") && !HasRank(sender, "trusted") {
-		return false, true
-	}
-
-	close(singManager.activeSession.StopChan)
-	singManager.activeSession = nil
-	return true, false
-}
-
-// IsSinging returns true if currently singing
-func IsSinging() bool {
-	if singManager == nil {
-		return false
-	}
-
-	singManager.mu.Lock()
-	defer singManager.mu.Unlock()
-	return singManager.activeSession != nil
-}
-
-// fetchLyrics fetches synced lyrics from lrclib.net
-func fetchLyrics(query string) ([]LyricLine, string, string, error) {
-	// Search for the song
-	searchURL := fmt.Sprintf("https://lrclib.net/api/search?q=%s", url.QueryEscape(query))
-
-	httpClient := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest("GET", searchURL, nil)
-	if err != nil {
-		return nil, "", "", err
-	}
-	req.Header.Set("User-Agent", "GraceBot/1.0")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, "", "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, "", "", fmt.Errorf("API returned status %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", "", err
-	}
-
-	var results []lrcLibResponse
-	if err := json.Unmarshal(body, &results); err != nil {
-		return nil, "", "", err
-	}
-
-	// Find first result with synced lyrics
-	for _, result := range results {
-		if result.SyncedLyrics != "" {
-			lyrics := parseLRC(result.SyncedLyrics)
-			return lyrics, result.TrackName, result.ArtistName, nil
+	for _, track := range tracks {
+		if lyrics := parseLRC(track.Synced); len(lyrics) != 0 {
+			return lyrics, track.Track, track.Artist, true, nil
 		}
 	}
-
-	// Fall back to plain lyrics if no synced available
-	if len(results) > 0 && results[0].PlainLyrics != "" {
-		lyrics := parsePlainLyrics(results[0].PlainLyrics)
-		return lyrics, results[0].TrackName, results[0].ArtistName, nil
+	for _, track := range tracks {
+		if lyrics := parsePlainLyrics(track.Plain); len(lyrics) != 0 {
+			return lyrics, track.Track, track.Artist, false, nil
+		}
 	}
-
-	return nil, "", "", fmt.Errorf("no lyrics found")
+	return nil, "", "", false, fmt.Errorf("no usable lyrics found for %q", query)
 }
 
-// parseLRC parses LRC format lyrics with timestamps
-// Format: [mm:ss.xx] lyrics text
-func parseLRC(lrc string) []LyricLine {
-	var lyrics []LyricLine
-	// Match [mm:ss.xx] or [mm:ss]
-	timeRe := regexp.MustCompile(`\[(\d+):(\d+)(?:\.(\d+))?\](.*)`)
-
+// LRC permits multiple timestamps per line and fractional seconds of varying precision.
+func parseLRC(lrc string) []lyricLine {
+	var lyrics []lyricLine
+	var offset time.Duration
 	for line := range strings.SplitSeq(lrc, "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		matches := timeRe.FindStringSubmatch(line)
-		if matches == nil {
-			continue
-		}
-
-		minutes, _ := strconv.Atoi(matches[1])
-		seconds, _ := strconv.Atoi(matches[2])
-		milliseconds := 0
-		if matches[3] != "" {
-			ms, _ := strconv.Atoi(matches[3])
-			// Handle different precision (2 or 3 digits)
-			if len(matches[3]) == 2 {
-				milliseconds = ms * 10
-			} else {
-				milliseconds = ms
+		if strings.HasPrefix(line, "[offset:") && strings.HasSuffix(line, "]") {
+			ms, err := strconv.ParseInt(strings.TrimSuffix(strings.TrimPrefix(line, "[offset:"), "]"), 10, 32)
+			if err == nil {
+				offset = time.Duration(ms) * time.Millisecond
 			}
+			continue
 		}
-
-		text := strings.TrimSpace(matches[4])
-
-		timestamp := time.Duration(minutes)*time.Minute +
-			time.Duration(seconds)*time.Second +
-			time.Duration(milliseconds)*time.Millisecond
-
-		lyrics = append(lyrics, LyricLine{
-			Time: timestamp,
-			Text: text,
-		})
+		first := len(lyrics)
+		for strings.HasPrefix(line, "[") {
+			end := strings.IndexByte(line, ']')
+			if end < 0 {
+				break
+			}
+			tag := line[1:end]
+			line = strings.TrimSpace(line[end+1:])
+			minuteText, secondText, ok := strings.Cut(tag, ":")
+			if !ok {
+				continue
+			}
+			minutes, err := strconv.Atoi(minuteText)
+			if err != nil || minutes < 0 || minutes > 1440 {
+				continue
+			}
+			seconds, err := time.ParseDuration(secondText + "s")
+			if err != nil || seconds < 0 || seconds >= time.Minute {
+				continue
+			}
+			lyrics = append(lyrics, lyricLine{at: time.Duration(minutes)*time.Minute + seconds})
+		}
+		if line == "" {
+			lyrics = lyrics[:first]
+			continue
+		}
+		for i := first; i < len(lyrics); i++ {
+			lyrics[i].text = line
+		}
 	}
-
-	// Sort by timestamp
-	sort.Slice(lyrics, func(i, j int) bool {
-		return lyrics[i].Time < lyrics[j].Time
-	})
-
+	for i := range lyrics {
+		// A positive LRC offset means the lyrics should be displayed earlier.
+		lyrics[i].at = max(0, lyrics[i].at-offset)
+	}
+	sort.SliceStable(lyrics, func(i, j int) bool { return lyrics[i].at < lyrics[j].at })
 	return lyrics
 }
 
-// parsePlainLyrics parses plain lyrics without timestamps
-// Sends one line per second
-func parsePlainLyrics(plain string) []LyricLine {
-	var lyrics []LyricLine
-	timestamp := time.Duration(0)
-
+func parsePlainLyrics(plain string) []lyricLine {
+	var lyrics []lyricLine
+	var at time.Duration
 	for line := range strings.SplitSeq(plain, "\n") {
-		line = strings.TrimSpace(line)
-		lyrics = append(lyrics, LyricLine{
-			Time: timestamp,
-			Text: line,
-		})
-		// Add 2 seconds between lines for plain lyrics
-		timestamp += 2 * time.Second
+		if text := strings.TrimSpace(line); text != "" {
+			lyrics = append(lyrics, lyricLine{at: at, text: text})
+			at += 2 * time.Second
+		}
 	}
-
 	return lyrics
 }
