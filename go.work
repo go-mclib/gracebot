@@ -1,4 +1,7 @@
-go 1.25.0
+go 1.26.0
 
-// Keep GraceBot on its pinned revisions rather than the parent workspace's checkouts.
-use .
+use (
+	.
+	../client
+	../data-gracebot
+)

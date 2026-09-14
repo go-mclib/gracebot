@@ -3,3 +3,9 @@
 personality.txt
 player_data.json
 admins.json
+chat_history.jsonl
+gracebot
+gracebot.db
+gracebot.db-wal
+gracebot.db-shm
+chat_archives/

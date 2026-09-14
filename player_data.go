@@ -3,99 +3,98 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"maps"
+	"log"
+	"net/url"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
+
+	_ "modernc.org/sqlite"
 )
 
-type playerRecord struct {
-	GamePoints           map[string]int `json:"game_points,omitempty"`
-	Ranks                []string       `json:"ranks,omitempty"`
-	LastSeen             int64          `json:"last_seen,omitempty"`
-	TotalPlaytimeSeconds int64          `json:"total_playtime_seconds,omitempty"`
-	WordCounts           map[string]int `json:"word_counts,omitempty"`
-	DeathCounts          map[string]int `json:"death_counts,omitempty"`
-}
-
+// All durable state has one transactional owner. online only identifies live
+// observation intervals; it is never restored across a process restart.
 type playerStore struct {
-	mu sync.RWMutex
-	// Serialize the snapshot and replacement together so an older save cannot
-	// replace a newer snapshot after concurrent callers finish out of order.
-	saveMu   sync.Mutex
-	players  map[string]*playerRecord
-	admins   map[string]bool
-	dataPath string
+	db            *sql.DB
+	admins        map[string]bool
+	mu            sync.Mutex
+	online        map[string]int64
+	presenceAt    time.Time
+	maintenanceMu sync.Mutex
 }
 
-func openPlayerStore(dataPath, adminPath string) (*playerStore, error) {
-	if strings.TrimSpace(dataPath) == "" || strings.TrimSpace(adminPath) == "" {
-		return nil, errors.New("player and admin storage paths are required")
+func openPlayerStore(databasePath, adminPath string) (*playerStore, error) {
+	if strings.TrimSpace(databasePath) == "" || strings.TrimSpace(adminPath) == "" {
+		return nil, errors.New("database and admin paths are required")
 	}
-	s := &playerStore{players: make(map[string]*playerRecord), admins: make(map[string]bool), dataPath: dataPath}
+	absolute, err := filepath.Abs(databasePath)
+	if err != nil {
+		return nil, err
+	}
+	databasePath = absolute
+	if info, err := os.Lstat(databasePath); err == nil && !info.Mode().IsRegular() {
+		return nil, errors.New("database must be a regular file")
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
 	var admins []string
 	if err := readStoreJSON(adminPath, &admins); err != nil {
 		return nil, err
 	}
-	for _, admin := range admins {
-		admin = normalizeStoreName(admin)
-		if admin == "" {
-			return nil, fmt.Errorf("%s: empty admin name", adminPath)
+	s := &playerStore{admins: map[string]bool{}, online: map[string]int64{}}
+	for _, name := range admins {
+		name, err := storePlayerName(name)
+		if err != nil {
+			return nil, fmt.Errorf("admin name: %w", err)
 		}
-		s.admins[admin] = true
+		s.admins[name] = true
 	}
-	// Keep the legacy field confined to loading; saving always writes only the
-	// current schema, so migration cannot be applied twice.
-	var loaded map[string]*struct {
-		playerRecord
-		WordlePoints int `json:"wordle_points,omitempty"`
-	}
-	if err := readStoreJSON(dataPath, &loaded); err != nil {
+	dir := filepath.Dir(databasePath)
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
-	for name, record := range loaded {
-		key := normalizeStoreName(name)
-		if key == "" || record == nil {
-			return nil, fmt.Errorf("%s: invalid player record %q", dataPath, name)
-		}
-		if _, exists := s.players[key]; exists {
-			return nil, fmt.Errorf("%s: duplicate normalized player %q", dataPath, key)
-		}
-		if record.LastSeen < 0 || record.TotalPlaytimeSeconds < 0 || record.WordlePoints < 0 {
-			return nil, fmt.Errorf("%s: negative player statistic for %q", dataPath, name)
-		}
-		for _, counts := range []map[string]int{record.GamePoints, record.WordCounts, record.DeathCounts} {
-			for label, count := range counts {
-				if label == "" || count < 0 {
-					return nil, fmt.Errorf("%s: invalid count for player %q", dataPath, name)
-				}
-			}
-		}
-		if record.GamePoints == nil {
-			record.GamePoints = make(map[string]int)
-		}
-		if _, exists := record.GamePoints["wordle"]; !exists && record.WordlePoints > 0 {
-			record.GamePoints["wordle"] = record.WordlePoints
-		}
-		ranks := make([]string, 0, len(record.Ranks))
-		for _, rank := range record.Ranks {
-			rank = normalizeStoreName(rank)
-			// Admin authority is exclusively the separately loaded admins file.
-			if rank != "" && rank != "admin" && rank != "default" && !slices.Contains(ranks, rank) {
-				ranks = append(ranks, rank)
-			}
-		}
-		slices.Sort(ranks)
-		record.Ranks = ranks
-		s.players[key] = &record.playerRecord
+	// Never chmod an existing parent directory: it may contain unrelated user data.
+	f, err := os.OpenFile(databasePath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	err = errors.Join(f.Chmod(0600), f.Close())
+	if err != nil {
+		return nil, err
+	}
+	dsn := (&url.URL{Scheme: "file", Path: databasePath}).String()
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	s.db = db
+	db.SetMaxOpenConns(1)
+	if _, err = db.Exec(`PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=4194304;
+ CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, kind TEXT NOT NULL, sender TEXT NOT NULL, owner TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'live', source_id INTEGER);
+ CREATE INDEX IF NOT EXISTS events_time ON events(at,id);
+ CREATE INDEX IF NOT EXISTS events_actor ON events(sender,at,id);
+ CREATE INDEX IF NOT EXISTS events_owner ON events(owner,id);
+ CREATE TABLE IF NOT EXISTS tokens(event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE, word TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(event_id,word));
+ CREATE INDEX IF NOT EXISTS tokens_word ON tokens(word,event_id);
+ CREATE TABLE IF NOT EXISTS scores(player TEXT NOT NULL, game TEXT NOT NULL, points INTEGER NOT NULL CHECK(points>=0), PRIMARY KEY(player,game));
+ CREATE TABLE IF NOT EXISTS ranks(player TEXT NOT NULL, rank TEXT NOT NULL, PRIMARY KEY(player,rank));
+ CREATE TABLE IF NOT EXISTS presence(id INTEGER PRIMARY KEY, player TEXT NOT NULL, start INTEGER NOT NULL, end INTEGER NOT NULL CHECK(end>=start));
+ CREATE INDEX IF NOT EXISTS presence_player ON presence(player,start);
+ CREATE TABLE IF NOT EXISTS imports(source TEXT PRIMARY KEY, digest TEXT NOT NULL, imported_at INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS legacy_aggregates(player TEXT PRIMARY KEY, document TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS memories(id INTEGER PRIMARY KEY AUTOINCREMENT, subject TEXT NOT NULL, fact TEXT NOT NULL, owner TEXT NOT NULL, visibility TEXT NOT NULL CHECK(visibility IN ('public','private')), attribution TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+ CREATE INDEX IF NOT EXISTS memories_subject ON memories(subject,id);
+ CREATE TABLE IF NOT EXISTS memory_sources(memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE, event_id INTEGER NOT NULL, owner TEXT NOT NULL, sender TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY(memory_id,event_id));`); err != nil {
+		db.Close()
+		return nil, err
 	}
 	return s, nil
 }
@@ -106,102 +105,39 @@ func readStoreJSON(path string, target any) error {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("read %s: %w", path, err)
+		return err
 	}
 	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
-		return fmt.Errorf("decode %s: null is not a storage document", path)
+		return errors.New("null is not a storage document")
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
+	d := json.NewDecoder(bytes.NewReader(data))
+	d.DisallowUnknownFields()
+	if err = d.Decode(target); err != nil {
 		return fmt.Errorf("decode %s: %w", path, err)
 	}
 	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		if err == nil {
-			err = errors.New("multiple JSON values")
-		}
-		return fmt.Errorf("decode %s: %w", path, err)
+	if err = d.Decode(&extra); err != io.EOF {
+		return errors.New("trailing storage data")
 	}
 	return nil
 }
 
-func (s *playerStore) save() (err error) {
-	s.saveMu.Lock()
-	defer s.saveMu.Unlock()
-	s.mu.RLock()
-	data, err := json.MarshalIndent(s.players, "", "  ")
-	s.mu.RUnlock()
-	if err != nil {
-		return fmt.Errorf("encode player data: %w", err)
+func (s *playerStore) history() *chatHistory { return &chatHistory{store: s} }
+func (s *playerStore) checkpoint(ctx context.Context) error {
+	var busy, logFrames, checkpointed int
+	if err := s.db.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &checkpointed); err != nil {
+		return err
 	}
-	file, err := os.CreateTemp(filepath.Dir(s.dataPath), ".player-data-*")
-	if err != nil {
-		return fmt.Errorf("create player data snapshot: %w", err)
+	if busy != 0 {
+		return errors.New("SQLite checkpoint busy")
 	}
-	closed, renamed := false, false
-	defer func() {
-		if !closed {
-			err = errors.Join(err, file.Close())
-		}
-		if !renamed {
-			err = errors.Join(err, os.Remove(file.Name()))
-		}
-	}()
-	if _, err = file.Write(data); err != nil {
-		return fmt.Errorf("write player data snapshot: %w", err)
-	}
-	if err = file.Sync(); err != nil {
-		return fmt.Errorf("sync player data snapshot: %w", err)
-	}
-	err = file.Close()
-	closed = true
-	if err != nil {
-		return fmt.Errorf("close player data snapshot: %w", err)
-	}
-	if err = os.Rename(file.Name(), s.dataPath); err != nil {
-		return fmt.Errorf("replace player data: %w", err)
-	}
-	renamed = true
 	return nil
 }
-
-func normalizeStoreName(value string) string {
-	return strings.ToLower(strings.TrimSpace(value))
+func (s *playerStore) close() error {
+	return errors.Join(s.disconnectPresence(time.Now()), s.checkpoint(context.Background()), s.db.Close())
 }
 
-// Callers hold mu for writing. No record pointer escapes the store.
-func (s *playerStore) playerLocked(name string) *playerRecord {
-	if s.players[name] == nil {
-		s.players[name] = &playerRecord{}
-	}
-	return s.players[name]
-}
-
-func (s *playerStore) recordChat(sender, message string, at time.Time) {
-	sender = normalizeStoreName(sender)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	player := s.playerLocked(sender)
-	now := at.Unix()
-	if now > player.LastSeen {
-		gap := now - player.LastSeen
-		if player.LastSeen > 0 && gap <= 300 {
-			player.TotalPlaytimeSeconds += gap
-		}
-		player.LastSeen = now
-	}
-	for _, word := range strings.Fields(message) {
-		word = normalizeCountWord(word)
-		if word != "" {
-			if player.WordCounts == nil {
-				player.WordCounts = make(map[string]int)
-			}
-			player.WordCounts[word]++
-		}
-	}
-}
-
+func normalizeStoreName(value string) string { return strings.ToLower(strings.TrimSpace(value)) }
 func normalizeCountWord(word string) string {
 	return strings.Map(func(r rune) rune {
 		if unicode.IsLetter(r) || unicode.IsNumber(r) {
@@ -210,68 +146,18 @@ func normalizeCountWord(word string) string {
 		return -1
 	}, word)
 }
-
-func (s *playerStore) recordDeath(sender, cause string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	player := s.playerLocked(normalizeStoreName(sender))
-	if player.DeathCounts == nil {
-		player.DeathCounts = make(map[string]int)
-	}
-	player.DeathCounts[cause]++
-}
-
-func (s *playerStore) hasRank(sender, rank string) bool {
-	sender, rank = normalizeStoreName(sender), normalizeStoreName(rank)
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	switch rank {
-	case "default":
-		return true
-	case "admin":
-		return s.admins[sender]
-	default:
-		player := s.players[sender]
-		return player != nil && slices.Contains(player.Ranks, rank)
-	}
-}
-
-func (s *playerStore) addPoint(sender, game string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	player := s.playerLocked(normalizeStoreName(sender))
-	game = normalizeStoreName(game)
-	if player.GamePoints == nil {
-		player.GamePoints = make(map[string]int)
-	}
-	player.GamePoints[game]++
-	return player.GamePoints[game]
-}
-
-func (s *playerStore) ranksLocked(name string) []string {
-	ranks := []string{"default"}
-	if s.admins[name] {
-		ranks = append(ranks, "admin")
-	}
-	if player := s.players[name]; player != nil {
-		ranks = append(ranks, player.Ranks...)
-	}
-	return ranks
-}
-
 func validStoreIdentifier(value string, maxLength int, underscore bool) bool {
 	if len(value) == 0 || len(value) > maxLength {
 		return false
 	}
 	for _, c := range value {
-		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || (underscore && c == '_') {
+		if c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || underscore && c == '_' {
 			continue
 		}
 		return false
 	}
 	return true
 }
-
 func storePlayerName(value string) (string, error) {
 	value = normalizeStoreName(value)
 	if !validStoreIdentifier(value, 16, true) {
@@ -279,229 +165,109 @@ func storePlayerName(value string) (string, error) {
 	}
 	return value, nil
 }
-
-func (s *playerStore) tools() []toolSpec {
-	return []toolSpec{
-		makeTool("player_stats", "Get a player's ranks, game points, last seen, approximate chat-active seconds (not online playtime), and death counts. Defaults to the requesting player.", map[string]any{
-			"player": map[string]any{"type": "string", "description": "Minecraft username; omit for the requester"},
-		}, nil, s.playerStatsTool),
-		makeTool("leaderboard", "Rank players by game points or total deaths, highest first; ties sort by username.", map[string]any{
-			"metric": map[string]any{"type": "string", "enum": []string{"game", "deaths"}},
-			"game":   map[string]any{"type": "string", "description": "Required for game metric, e.g. wordle or hangman; omit for deaths"},
-			"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": 25, "description": "Maximum entries; defaults to 10"},
-		}, []string{"metric"}, s.leaderboardTool),
-		makeTool("word_count", "Count a word in recorded chat, case-insensitive and ignoring punctuation. Omit player to count globally.", map[string]any{
-			"word":   map[string]any{"type": "string"},
-			"player": map[string]any{"type": "string", "description": "Minecraft username; omit for all players"},
-		}, []string{"word"}, s.wordCountTool),
-		makeTool("set_rank", "Add or remove a custom player rank. Only an administrator from the admins file may do this; admin and default ranks cannot be changed.", map[string]any{
-			"player": map[string]any{"type": "string"},
-			"rank":   map[string]any{"type": "string", "description": "1–64 letters or digits, excluding admin and default"},
-			"action": map[string]any{"type": "string", "enum": []string{"add", "remove"}},
-		}, []string{"player", "rank", "action"}, s.setRankTool),
+func storageActor(value string) (string, error) {
+	if value == consoleActor || value == "@server" {
+		return value, nil
 	}
+	return storePlayerName(value)
 }
-
-func (s *playerStore) playerStatsTool(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
-	var args struct {
-		Player *string `json:"player"`
+func (s *playerStore) hasRank(sender, rank string) bool {
+	sender, rank = normalizeStoreName(sender), normalizeStoreName(rank)
+	if rank == "default" {
+		return true
 	}
-	if err := decodeArgs(raw, &args); err != nil {
-		return nil, err
+	if rank == "admin" {
+		return sender == consoleActor || s.admins[sender]
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
+	var found int
+	return s.db.QueryRow("SELECT 1 FROM ranks WHERE player=? AND rank=?", sender, rank).Scan(&found) == nil
+}
+func (s *playerStore) addPoint(sender, game string) int {
+	sender, err := storePlayerName(sender)
+	game = normalizeStoreName(game)
+	if err != nil || !validStoreIdentifier(game, 64, true) {
+		log.Printf("invalid game score attribution")
+		return 0
 	}
-	name := actor
-	if args.Player != nil {
-		name = *args.Player
+	var points int
+	err = s.db.QueryRow("INSERT INTO scores(player,game,points) VALUES(?,?,1) ON CONFLICT(player,game) DO UPDATE SET points=points+1 RETURNING points", sender, game).Scan(&points)
+	if err != nil {
+		log.Printf("persist game score: %v", err)
+		return 0
 	}
-	name, err := storePlayerName(name)
+	return points
+}
+func (s *playerStore) playerRanks(ctx context.Context, name string) ([]string, error) {
+	result := []string{"default"}
+	if s.hasRank(name, "admin") {
+		result = append(result, "admin")
+	}
+	rows, err := s.db.QueryContext(ctx, "SELECT rank FROM ranks WHERE player=? ORDER BY rank", name)
 	if err != nil {
 		return nil, err
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	player, exists := s.players[name]
-	if !exists {
-		player = &playerRecord{}
-	}
-	deaths := 0
-	for _, count := range player.DeathCounts {
-		deaths += count
-	}
-	var lastSeen *time.Time
-	if player.LastSeen > 0 {
-		at := time.Unix(player.LastSeen, 0).UTC()
-		lastSeen = &at
-	}
-	return map[string]any{
-		"player": name, "recorded": exists, "ranks": s.ranksLocked(name),
-		"game_points": maps.Clone(player.GamePoints), "last_seen": lastSeen,
-		"chat_active_seconds": player.TotalPlaytimeSeconds,
-		"total_deaths":        deaths, "death_counts": maps.Clone(player.DeathCounts),
-	}, nil
-}
-
-func (s *playerStore) leaderboardTool(ctx context.Context, _ string, raw json.RawMessage) (any, error) {
-	var args struct {
-		Metric string  `json:"metric"`
-		Game   *string `json:"game"`
-		Limit  *int    `json:"limit"`
-	}
-	if err := decodeArgs(raw, &args); err != nil {
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if args.Metric != "game" && args.Metric != "deaths" {
-		return nil, errors.New("metric must be game or deaths")
-	}
-	game := ""
-	if args.Metric == "game" {
-		if args.Game == nil {
-			return nil, errors.New("game is required for game leaderboard")
-		}
-		game = normalizeStoreName(*args.Game)
-		if !validStoreIdentifier(game, 64, true) {
-			return nil, errors.New("invalid game name")
-		}
-	} else if args.Game != nil {
-		return nil, errors.New("game must be omitted for death leaderboard")
-	}
-	limit := 10
-	if args.Limit != nil {
-		limit = *args.Limit
-	}
-	if limit < 1 || limit > 25 {
-		return nil, errors.New("limit must be between 1 and 25")
-	}
-	type entry struct {
-		Rank   int    `json:"rank"`
-		Player string `json:"player"`
-		Count  int    `json:"count"`
-	}
-	entries := make([]entry, 0)
-	s.mu.RLock()
-	for name, player := range s.players {
-		count := player.GamePoints[game]
-		if args.Metric == "deaths" {
-			count = 0
-			for _, deaths := range player.DeathCounts {
-				count += deaths
-			}
-		}
-		if count > 0 {
-			entries = append(entries, entry{Player: name, Count: count})
-		}
-	}
-	s.mu.RUnlock()
-	slices.SortFunc(entries, func(a, b entry) int {
-		if a.Count > b.Count {
-			return -1
-		}
-		if a.Count < b.Count {
-			return 1
-		}
-		return strings.Compare(a.Player, b.Player)
-	})
-	if len(entries) > limit {
-		entries = entries[:limit]
-	}
-	for index := range entries {
-		entries[index].Rank = index + 1
-	}
-	return map[string]any{"metric": args.Metric, "game": game, "entries": entries}, nil
-}
-
-func (s *playerStore) wordCountTool(ctx context.Context, _ string, raw json.RawMessage) (any, error) {
-	var args struct {
-		Word   string  `json:"word"`
-		Player *string `json:"player"`
-	}
-	if err := decodeArgs(raw, &args); err != nil {
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if len(args.Word) > 256 || len(strings.Fields(args.Word)) != 1 {
-		return nil, errors.New("word must be one word of at most 256 bytes")
-	}
-	word := normalizeCountWord(args.Word)
-	if word == "" {
-		return nil, errors.New("word must contain letters or digits")
-	}
-	name := ""
-	if args.Player != nil {
-		var err error
-		name, err = storePlayerName(*args.Player)
-		if err != nil {
+	defer rows.Close()
+	for rows.Next() {
+		var rank string
+		if err = rows.Scan(&rank); err != nil {
 			return nil, err
 		}
+		result = append(result, rank)
 	}
-	count := 0
-	s.mu.RLock()
-	if name == "" {
-		for _, player := range s.players {
-			count += player.WordCounts[word]
-		}
-	} else if player := s.players[name]; player != nil {
-		count = player.WordCounts[word]
-	}
-	s.mu.RUnlock()
-	return map[string]any{"word": word, "player": name, "global": name == "", "count": count}, nil
+	return result, rows.Err()
 }
-
 func (s *playerStore) setRankTool(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
-	var args struct {
+	var a struct {
 		Player string `json:"player"`
 		Rank   string `json:"rank"`
 		Action string `json:"action"`
 	}
-	if err := decodeArgs(raw, &args); err != nil {
+	if err := decodeArgs(raw, &a); err != nil {
 		return nil, err
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
+	if !s.hasRank(actor, "admin") {
+		return nil, errors.New("administrator authority required")
 	}
-	name, err := storePlayerName(args.Player)
+	name, err := storePlayerName(a.Player)
 	if err != nil {
 		return nil, err
 	}
-	rank := normalizeStoreName(args.Rank)
-	if !validStoreIdentifier(rank, 64, false) {
-		return nil, errors.New("rank must contain 1–64 letters or digits")
+	rank := normalizeStoreName(a.Rank)
+	if !validStoreIdentifier(rank, 64, false) || rank == "admin" || rank == "default" {
+		return nil, errors.New("invalid or reserved rank")
 	}
-	if rank == "admin" || rank == "default" {
-		return nil, errors.New("reserved ranks cannot be changed")
-	}
-	if args.Action != "add" && args.Action != "remove" {
+	var result sql.Result
+	switch a.Action {
+	case "add":
+		result, err = s.db.ExecContext(ctx, "INSERT OR IGNORE INTO ranks(player,rank) VALUES(?,?)", name, rank)
+	case "remove":
+		result, err = s.db.ExecContext(ctx, "DELETE FROM ranks WHERE player=? AND rank=?", name, rank)
+	default:
 		return nil, errors.New("action must be add or remove")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.admins[normalizeStoreName(actor)] {
-		return nil, errors.New("only an administrator from the admins file may change ranks")
+	if err != nil {
+		return nil, err
 	}
-	player := s.players[name]
-	index := -1
-	if player != nil {
-		index = slices.Index(player.Ranks, rank)
+	n, err := result.RowsAffected()
+	if err != nil {
+		return nil, err
 	}
-	if args.Action == "add" {
-		if index >= 0 {
-			return nil, errors.New("player already has this rank")
-		}
-		player = s.playerLocked(name)
-		player.Ranks = append(player.Ranks, rank)
-		slices.Sort(player.Ranks)
-	} else {
-		if index < 0 {
-			return nil, errors.New("player does not have this rank")
-		}
-		player.Ranks = slices.Delete(player.Ranks, index, index+1)
+	if n == 0 {
+		return nil, errors.New("rank already in requested state")
 	}
-	return map[string]any{"player": name, "ranks": s.ranksLocked(name), "action": args.Action, "rank": rank}, nil
+	ranks, err := s.playerRanks(ctx, name)
+	return map[string]any{"player": name, "ranks": ranks, "action": a.Action, "rank": rank}, err
+}
+func (s *playerStore) tools() []toolSpec {
+	str := map[string]any{"type": "string"}
+	limit := map[string]any{"type": "integer", "minimum": 1, "maximum": 25}
+	tools := []toolSpec{
+		makeTool("player_stats", "Statistics derived from retained public player chat, deaths and observed presence; games and ranks persist. Seven UTC calendar dates including today, not lifetime playtime.", map[string]any{"player": str}, nil, s.playerStatsTool),
+		makeTool("leaderboard", "Rank game scores or retained public messages, words, deaths and observed online seconds.", map[string]any{"metric": map[string]any{"type": "string", "enum": []string{"game", "messages", "words", "deaths", "observed_online_seconds"}}, "game": str, "limit": limit}, []string{"metric"}, s.leaderboardTool),
+		makeTool("word_count", "Count a normalized word in retained public player chat; private messages never contribute.", map[string]any{"word": str, "player": str}, []string{"word"}, s.wordCountTool),
+		makeTool("top_words", "Most frequent normalized words in retained public player chat; private messages never contribute.", map[string]any{"player": str, "limit": limit}, nil, s.topWordsTool),
+		makeTool("server_stats", "Aggregate retained public events and observed presence, not lifetime server statistics.", map[string]any{}, nil, s.serverStatsTool),
+		makeTool("set_rank", "Administrator-only custom rank change; admin/default cannot be changed.", map[string]any{"player": str, "rank": str, "action": map[string]any{"type": "string", "enum": []string{"add", "remove"}}}, []string{"player", "rank", "action"}, s.setRankTool),
+	}
+	return append(tools, s.memoryTools()...)
 }

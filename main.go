@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/url"
 	"os"
 	"os/signal"
@@ -31,7 +33,10 @@ type config struct {
 	online, verbose, interactive, gravity, respawn, disconnectOnTransfer bool
 	reconnects                                                           int
 	aliases                                                              []string
-	apiKey, apiBase, model, personalityPath, dataPath, adminsPath        string
+	apiKey, apiBase, model, personalityPath, databasePath, adminsPath    string
+	legacyDataPath, legacyHistoryPath, archivePath                       string
+	engagementTimeout, debounce                                          time.Duration
+	consoleChat, consoleInput                                            bool
 }
 
 func readConfig(args []string) (config, error) {
@@ -53,7 +58,7 @@ func readConfig(args []string) (config, error) {
 		cfg.model = value
 	}
 	cfg.clientID = os.Getenv("AZURE_CLIENT_ID")
-	aliases := "grace,bot"
+	aliases := "grace,steedsgate,steeds"
 	if value, set := os.LookupEnv("GRACEBOT_ALIASES"); set {
 		aliases = value
 	}
@@ -72,8 +77,15 @@ func readConfig(args []string) (config, error) {
 	flags.StringVar(&cfg.apiBase, "api-base", cfg.apiBase, "OpenAI-compatible API base URL (LLM_BASE_URL)")
 	flags.StringVar(&cfg.model, "model", cfg.model, "tool-capable chat model (LLM_MODEL)")
 	flags.StringVar(&cfg.personalityPath, "personality", "personality.txt", "optional personality text file")
-	flags.StringVar(&cfg.dataPath, "data", "player_data.json", "player statistics file")
+	flags.StringVar(&cfg.databasePath, "database", "gracebot.db", "SQLite chat, memory, scores and ranks database")
 	flags.StringVar(&cfg.adminsPath, "admins", "admins.json", "administrator usernames JSON file")
+	flags.StringVar(&cfg.legacyDataPath, "import-data", "player_data.json", "one-time legacy player JSON import, empty disables")
+	flags.StringVar(&cfg.legacyHistoryPath, "import-history", "chat_history.jsonl", "one-time legacy JSONL import, empty disables")
+	flags.StringVar(&cfg.archivePath, "archives", "chat_archives", "private daily compressed chat archive directory")
+	flags.DurationVar(&cfg.engagementTimeout, "conversation-timeout", defaultEngagementTimeout, "incoming silence timeout (0 requires mentions)")
+	flags.DurationVar(&cfg.debounce, "chat-debounce", defaultChatDebounce, "quiet period before processing a speaker's message batch")
+	flags.BoolVar(&cfg.consoleChat, "console-chat", false, "loopback testing only: respond to server /say as an UNPRIVILEGED speaker")
+	flags.BoolVar(&cfg.consoleInput, "console-input", false, "loopback testing only: operator requests from this bot's stdin")
 	if err := flags.Parse(args); err != nil {
 		return cfg, err
 	}
@@ -92,6 +104,24 @@ func readConfig(args []string) (config, error) {
 	}
 	if cfg.reconnects < -1 {
 		return cfg, fmt.Errorf("reconnects must be -1 or nonnegative")
+	}
+	if cfg.engagementTimeout < 0 || cfg.engagementTimeout > 30*time.Minute {
+		return cfg, fmt.Errorf("conversation-timeout must be between 0 and 30m")
+	}
+	if cfg.debounce < 0 || cfg.debounce > 10*time.Second {
+		return cfg, fmt.Errorf("chat-debounce must be between 0 and 10s")
+	}
+	if cfg.consoleChat || cfg.consoleInput {
+		host := cfg.address
+		if parsed, _, err := net.SplitHostPort(cfg.address); err == nil {
+			host = parsed
+		}
+		if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+			return cfg, fmt.Errorf("console testing requires a literal loopback server address such as 127.0.0.1:25576")
+		}
+		if cfg.consoleInput && cfg.interactive {
+			return cfg, fmt.Errorf("console-input and interactive chat cannot both read stdin")
+		}
 	}
 	if !cfg.online && cfg.username == "" {
 		cfg.username = "GraceBot"
@@ -138,23 +168,50 @@ func run(ctx context.Context, cfg config) (result error) {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("read personality: %w", err)
 	}
-	store, err := openPlayerStore(cfg.dataPath, cfg.adminsPath)
+	store, err := openPlayerStore(cfg.databasePath, cfg.adminsPath)
 	if err != nil {
 		return err
 	}
-	defer func() { result = errors.Join(result, store.save()) }()
+	defer func() { result = errors.Join(result, store.close()) }()
+	if err := store.importLegacy(cfg.legacyDataPath, cfg.legacyHistoryPath); err != nil {
+		return err
+	}
+	if err := store.maintenance(ctx, time.Now(), cfg.archivePath); err != nil {
+		return err
+	}
+	journal := store.history()
 	output := newChatOutput()
+	output.journal = journal
 	activities := newActivities(store, output.send)
 	defer activities.close()
-	tools := newToolRegistry(newGameManager(store).tools(), store.tools(), activities.tools(), []toolSpec{weatherTool()})
+	web := newWebTools()
+	defer web.close()
+	observations := newObservations()
+	actions := newActionManager(store)
+	defer actions.close()
+	commands := newServerCommands(store)
+	defer commands.close()
+	commands.bindJournal(journal)
+	commands.BeforeMutation = func() { actions.stopCurrent("server command") }
 	apiConfig := openai.DefaultConfig(cfg.apiKey)
 	apiConfig.BaseURL = cfg.apiBase
-	assistant := newAssistant(openai.NewClientWithConfig(apiConfig), cfg.model, string(personality), tools, output.send)
+	tools := newToolRegistry(newGameManager(store).tools(), store.tools(), activities.tools(),
+		observations.tools(), web.tools(), journal.tools(), commands.tools(), actions.tools(), []toolSpec{weatherTool()})
+	assistant := newAssistant(openai.NewClientWithConfig(apiConfig), cfg.model, string(personality), tools, output.sendMessage)
+	assistant.journal = journal
+	assistant.engagements.timeout = cfg.engagementTimeout
+	assistant.engagements.debounce = cfg.debounce
 	workerCtx, stopWorker := context.WithCancel(ctx)
 	workerDone := make(chan struct{})
 	go func() { defer close(workerDone); assistant.run(workerCtx) }()
 	defer func() { stopWorker(); <-workerDone }()
-	router := &chatRouter{assistant: assistant, store: store, aliases: cfg.aliases}
+	router := &chatRouter{assistant: assistant, store: store, aliases: cfg.aliases, journal: journal,
+		observations: observations, commands: commands, actions: actions, consoleChat: cfg.consoleChat}
+	if cfg.consoleInput {
+		consoleDone := make(chan struct{})
+		go func() { defer close(consoleDone); readConsoleInput(workerCtx, router, output) }()
+		defer func() { stopWorker(); <-consoleDone }()
+	}
 	log.Printf("GraceBot: Minecraft %s (protocol %d), model %s; aliases %q", data.MinecraftVersion, data.ProtocolVersion, cfg.model, cfg.aliases)
 	saveTicker := time.NewTicker(time.Minute)
 	defer saveTicker.Stop()
@@ -173,8 +230,8 @@ func run(ctx context.Context, cfg config) (result error) {
 			}
 			return err
 		case <-saveTicker.C:
-			if err := store.save(); err != nil {
-				log.Printf("save player data: %v", err)
+			if err := store.maintenance(ctx, time.Now(), cfg.archivePath); err != nil {
+				log.Printf("maintain chat storage: %v", err)
 			}
 		}
 	}
@@ -209,6 +266,7 @@ func connect(ctx context.Context, cfg config, router *chatRouter, output *chatOu
 func connectOnce(ctx context.Context, cfg config, router *chatRouter, output *chatOutput, activities *activities) error {
 	sessionCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	defer router.disconnect()
 	c := client.New(cfg.address, cfg.username, cfg.online)
 	c.Verbose, c.Interactive, c.Brand, c.ClientID = cfg.verbose, cfg.interactive, cfg.brand, cfg.clientID
 	// The application owns cancellable reconnects; the upstream retry loop ignores context cancellation.
@@ -219,7 +277,7 @@ func connectOnce(ctx context.Context, cfg config, router *chatRouter, output *ch
 	me := self.New()
 	me.SetAutoRespawn(cfg.respawn)
 	c.Register(me)
-	chat := &synchronizedChat{inner: chatmodule.New(), ctx: sessionCtx}
+	chat := &synchronizedChat{inner: chatmodule.New(), ctx: sessionCtx, client: c, gate: make(chan struct{}, 1)}
 	c.Register(chat)
 	voice := newVoiceChat()
 	c.Register(voice)
@@ -228,11 +286,14 @@ func connectOnce(ctx context.Context, cfg config, router *chatRouter, output *ch
 	players := playerlist.New()
 	c.Register(players)
 	c.Register(registry.New())
+	w := world.New()
+	c.Register(w)
+	router.observations.register(c, me, players, w)
 	if cfg.gravity {
-		c.Register(world.New())
 		c.Register(collisions.New())
 		c.Register(physics.New())
 	}
+	router.actions.register(c)
 	c.RegisterHandler(router.handler(sessionCtx, players))
 	var stopClose func() bool
 	c.OnConnect(func() {
@@ -241,20 +302,59 @@ func connectOnce(ctx context.Context, cfg config, router *chatRouter, output *ch
 		stopClose = context.AfterFunc(sessionCtx, func() { _ = tcp.Close() })
 	})
 	c.OnPlay(func() {
-		chat.mu.Lock()
+		chat.gate <- struct{}{}
 		chat.ready = true
-		chat.mu.Unlock()
-		output.bind(chat.SendMessage)
+		<-chat.gate
+		conn := c.Conn()
+		output.bind(func(ctx context.Context, text string) error { return chat.sendMessage(ctx, text, conn) }, c.Username)
+		output.bindWhisper(func(ctx context.Context, actor, text string) error {
+			return chat.sendCommand(ctx, "msg "+actor+" "+text, conn)
+		})
+		router.commands.bind(func(ctx context.Context, command string) error { return chat.sendCommand(ctx, command, conn) })
+		router.commands.bindDiscovery(chat.commands)
 		activities.bindVoice(voice)
 		log.Printf("Listening for current username %q and aliases %q", c.Username, cfg.aliases)
 	})
-	c.OnTransfer(func() { activities.bindVoice(nil); output.bind(nil) })
-	c.OnDisconnect(func() { cancel(); activities.bindVoice(nil); output.bind(nil) })
+	c.OnTransfer(func() { activities.bindVoice(nil); output.bind(nil, ""); router.disconnect() })
+	c.OnDisconnect(func() { cancel(); activities.bindVoice(nil); output.bind(nil, ""); router.disconnect() })
 	err := c.ConnectAndStart(sessionCtx)
 	if stopClose != nil {
 		stopClose()
 	}
-	output.bind(nil)
+	output.bind(nil, "")
 	_ = c.TCPClient.Close()
 	return err
+}
+
+// Unlike a Server /say packet, this input actually belongs to the local process
+// operator. Only explicit loopback test mode creates the privileged namespace.
+func readConsoleInput(ctx context.Context, router *chatRouter, output *chatOutput) {
+	stop := context.AfterFunc(ctx, func() { _ = os.Stdin.Close() })
+	defer stop()
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 4096), 8192)
+	for scanner.Scan() {
+		if ctx.Err() != nil {
+			return
+		}
+		text := scanner.Text()
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		username := output.identity()
+		if username == "" {
+			log.Print("console input ignored: Minecraft is not ready")
+			continue
+		}
+		at := time.Now()
+		id, err := router.journal.appendOwned("console", consoleActor, consoleActor, text, at)
+		if err != nil {
+			log.Printf("record console input: %v", err)
+			continue
+		}
+		router.enqueue(ctx, username, consoleActor, text, id, at, true)
+	}
+	if err := scanner.Err(); err != nil && ctx.Err() == nil {
+		log.Printf("console input: %v", err)
+	}
 }

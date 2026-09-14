@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -25,7 +24,7 @@ func storeToolResult(t *testing.T, store *playerStore, name, actor, arguments st
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := json.Unmarshal(data, target); err != nil {
+			if err = json.Unmarshal(data, target); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -34,160 +33,155 @@ func storeToolResult(t *testing.T, store *playerStore, name, actor, arguments st
 	t.Fatalf("tool %s not found", name)
 	return nil
 }
-
-func TestPlayerStoreAdminAuthority(t *testing.T) {
+func testPlayerStore(t *testing.T) *playerStore {
+	t.Helper()
 	dir := t.TempDir()
-	dataPath, adminPath := filepath.Join(dir, "players.json"), filepath.Join(dir, "admins.json")
-	if err := os.WriteFile(dataPath, []byte(`{"attacker":{"ranks":["AdMiN","builder"]}}`), 0600); err != nil {
+	admins := filepath.Join(dir, "admins.json")
+	if err := os.WriteFile(admins, []byte(`["RealAdmin"]`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(adminPath, []byte(`["RealAdmin"]`), 0600); err != nil {
-		t.Fatal(err)
-	}
-	store, err := openPlayerStore(dataPath, adminPath)
+	s, err := openPlayerStore(filepath.Join(dir, "state.sqlite"), admins)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if store.hasRank("ATTACKER", "ADMIN") {
-		t.Fatal("persisted admin rank granted authority")
+	t.Cleanup(func() {
+		if err := s.close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return s
+}
+func TestSQLiteRanksScoresPersistAndRemainAuthorized(t *testing.T) {
+	dir := t.TempDir()
+	db, admins := filepath.Join(dir, "state.sqlite"), filepath.Join(dir, "admins.json")
+	if err := os.WriteFile(admins, []byte(`["RealAdmin"]`), 0600); err != nil {
+		t.Fatal(err)
 	}
-	if !store.hasRank("REALADMIN", "AdMiN") || !store.hasRank("anyone", "DEFAULT") {
-		t.Fatal("case normalization changed reserved rank behavior")
+	s, err := openPlayerStore(db, admins)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !store.hasRank("ATTACKER", "BUILDER") {
-		t.Fatal("custom rank lost during normalization")
+	if !s.hasRank("REALADMIN", "ADMIN") || !s.hasRank("anyone", "default") {
+		t.Fatal("reserved authority lost")
 	}
-	if err := storeToolResult(t, store, "set_rank", "attacker", `{"player":"attacker","rank":"singer","action":"add"}`, nil); err == nil {
-		t.Fatal("non-admin changed a rank")
-	}
-	if err := storeToolResult(t, store, "set_rank", "attacker", `{"player":"attacker","rank":"singer","action":"add","actor":"RealAdmin"}`, nil); err == nil {
-		t.Fatal("model arguments spoofed runtime actor")
-	}
-	for _, rank := range []string{"AdMiN", "DEFAULT"} {
-		for _, action := range []string{"add", "remove"} {
-			args, err := json.Marshal(map[string]string{"player": "attacker", "rank": rank, "action": action})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := storeToolResult(t, store, "set_rank", "REALADMIN", string(args), nil); err == nil {
-				t.Fatalf("reserved rank %s allowed %s", rank, action)
-			}
+	for _, args := range []string{`{"player":"alice","rank":"builder","action":"add"}`, `{"player":"alice","rank":"builder","action":"add","actor":"RealAdmin"}`} {
+		if err := storeToolResult(t, s, "set_rank", "alice", args, nil); err == nil {
+			t.Fatal("ordinary player changed rank")
 		}
 	}
-	if err := storeToolResult(t, store, "set_rank", "REALADMIN", `{"player":"ATTACKER","rank":"Singer","action":"add"}`, nil); err != nil {
+	for _, rank := range []string{"ADMIN", "default", "x'); DROP TABLE ranks;--"} {
+		raw, _ := json.Marshal(map[string]string{"player": "alice", "rank": rank, "action": "add"})
+		if err := storeToolResult(t, s, "set_rank", "RealAdmin", string(raw), nil); err == nil {
+			t.Fatal("invalid rank granted")
+		}
+	}
+	if err := storeToolResult(t, s, "set_rank", "RealAdmin", `{"player":"alice","rank":"Builder","action":"add"}`, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.save(); err != nil {
+	if s.addPoint("ALICE", "wordle") != 1 || s.addPoint("alice", "wordle") != 2 {
+		t.Fatal("score increments lost")
+	}
+	if err = s.close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = openPlayerStore(dataPath, adminPath)
+	s, err = openPlayerStore(db, admins)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !store.hasRank("attacker", "singer") || store.hasRank("attacker", "admin") {
-		t.Fatal("saved ranks did not retain authorization boundaries")
+	defer s.close()
+	if !s.hasRank("alice", "builder") || s.hasRank("alice", "admin") || s.addPoint("alice", "wordle") != 3 {
+		t.Fatal("score/rank persistence changed")
 	}
-	if err := storeToolResult(t, store, "set_rank", "RealAdmin", `{"player":"attacker","rank":"SINGER","action":"remove"}`, nil); err != nil {
+	if err := storeToolResult(t, s, "set_rank", "RealAdmin", `{"player":"alice","rank":"builder","action":"remove"}`, nil); err != nil {
 		t.Fatal(err)
 	}
-	if store.hasRank("attacker", "singer") {
-		t.Fatal("removed rank still effective")
+	if s.hasRank("alice", "builder") {
+		t.Fatal("removed rank remains effective")
 	}
 }
-
-func TestPlayerStoreMigrationAndActivityRoundTrip(t *testing.T) {
-	dir := t.TempDir()
-	dataPath, adminPath := filepath.Join(dir, "players.json"), filepath.Join(dir, "admins.json")
-	initial := `{"Alice":{"wordle_points":4,"game_points":{"hangman":2},"ranks":["Builder"],"last_seen":1000,"total_playtime_seconds":10,"word_counts":{"hello":2},"death_counts":{"death.attack.fall":2}},"bob":{"wordle_points":5,"game_points":{"wordle":7}}}`
-	if err := os.WriteFile(dataPath, []byte(initial), 0600); err != nil {
-		t.Fatal(err)
-	}
-	store, err := openPlayerStore(dataPath, adminPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := store.addPoint("ALICE", "wordle"); got != 5 {
-		t.Fatalf("migrated score = %d, want 5", got)
-	}
-	if got := store.addPoint("bob", "wordle"); got != 8 {
-		t.Fatalf("canonical score = %d, want 8", got)
-	}
-	store.recordChat("Alice", "Hello! !hello", time.Unix(1300, 0))
-	store.recordChat("Alice", "hello", time.Unix(1601, 0))
-	store.recordChat("Alice", "hello", time.Unix(1600, 0))
-	store.recordDeath("ALICE", "death.attack.fall")
-	if err := store.save(); err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(dataPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(data), "wordle_points") {
-		t.Fatal("save retained legacy points and could remigrate them")
-	}
-	store, err = openPlayerStore(dataPath, adminPath)
-	if err != nil {
-		t.Fatal(err)
+func TestRetainedStatisticsDeriveFromVisibleEvents(t *testing.T) {
+	s := testPlayerStore(t)
+	h := s.history()
+	now := time.Now()
+	for _, e := range []chatEntry{{Kind: "player", Sender: "alice", Text: "Hello! hello world", At: now}, {Kind: "private", Sender: "bob", Owner: "bob", Text: "secret hello", At: now}, {Kind: "player", Sender: "alice", Text: "expired hello", At: historyCutoff(now).Add(-time.Nanosecond)}, {Kind: "bot", Sender: "GraceBot", Text: "hello", At: now}, {Kind: "death", Sender: "alice", Text: "death.attack.fall", At: now}} {
+		if _, err := h.appendOwned(e.Kind, e.Sender, e.Owner, e.Text, e.At); err != nil {
+			t.Fatal(err)
+		}
 	}
 	var stats struct {
-		Player     string         `json:"player"`
-		GamePoints map[string]int `json:"game_points"`
-		LastSeen   time.Time      `json:"last_seen"`
-		Active     int64          `json:"chat_active_seconds"`
-		Deaths     int            `json:"total_deaths"`
-		Causes     map[string]int `json:"death_counts"`
+		Messages int64 `json:"messages"`
+		Words    int64 `json:"words"`
+		Deaths   int64 `json:"deaths"`
 	}
-	if err := storeToolResult(t, store, "player_stats", "ALICE", `{}`, &stats); err != nil {
+	if err := storeToolResult(t, s, "server_stats", "alice", `{}`, &stats); err != nil {
 		t.Fatal(err)
 	}
-	if stats.Player != "alice" || stats.GamePoints["wordle"] != 5 || stats.GamePoints["hangman"] != 2 || stats.LastSeen.Unix() != 1601 || stats.Active != 310 || stats.Deaths != 3 || stats.Causes["death.attack.fall"] != 3 {
-		t.Fatalf("incorrect round-trip statistics: %+v", stats)
+	if stats.Messages != 1 || stats.Words != 3 || stats.Deaths != 1 {
+		t.Fatalf("public stats: %+v", stats)
 	}
-	var words struct {
-		Count int `json:"count"`
+	var count struct {
+		Count int64 `json:"count"`
 	}
-	if err := storeToolResult(t, store, "word_count", "bob", `{"word":"HELLO!"}`, &words); err != nil {
+	if err := storeToolResult(t, s, "word_count", "alice", `{"word":"HELLO!"}`, &count); err != nil {
 		t.Fatal(err)
 	}
-	if words.Count != 6 {
-		t.Fatalf("punctuated chat word count = %d, want 6", words.Count)
+	if count.Count != 2 {
+		t.Fatalf("private/expired word leaked: %d", count.Count)
 	}
-	if got := store.addPoint("alice", "wordle"); got != 6 {
-		t.Fatalf("reloaded score = %d, want 6", got)
+	if err := storeToolResult(t, s, "word_count", "bob", `{"word":"hello"}`, &count); err != nil {
+		t.Fatal(err)
+	}
+	if count.Count != 2 {
+		t.Fatal("public statistics included the owner's private event")
+	}
+	if _, err := s.db.Exec("DELETE FROM events WHERE kind='player'"); err != nil {
+		t.Fatal(err)
+	}
+	if err := storeToolResult(t, s, "word_count", "alice", `{"word":"hello"}`, &count); err != nil {
+		t.Fatal(err)
+	}
+	if count.Count != 0 {
+		t.Fatal("parallel counter survived event deletion")
 	}
 }
-
-func TestPlayerStoreRejectsDamagedStorage(t *testing.T) {
-	for _, fixture := range []struct{ name, players, admins string }{
-		{"truncated players", `{"alice":`, `[]`},
-		{"null player", `{"alice":null}`, `[]`},
-		{"null document", `null`, `[]`},
-		{"case collision", `{"alice":{},"ALICE":{}}`, `[]`},
-		{"invalid admins", `{}`, `{"admin":true}`},
-		{"trailing document", `{}`, `[] []`},
-	} {
-		t.Run(fixture.name, func(t *testing.T) {
-			dir := t.TempDir()
-			dataPath, adminPath := filepath.Join(dir, "players.json"), filepath.Join(dir, "admins.json")
-			if err := os.WriteFile(dataPath, []byte(fixture.players), 0600); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(adminPath, []byte(fixture.admins), 0600); err != nil {
-				t.Fatal(err)
-			}
-			if store, err := openPlayerStore(dataPath, adminPath); err == nil || store != nil {
-				t.Fatal("damaged storage opened as a writable store")
-			}
-			for path, want := range map[string]string{dataPath: fixture.players, adminPath: fixture.admins} {
-				got, err := os.ReadFile(path)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if string(got) != want {
-					t.Fatalf("opening damaged storage changed %s", path)
-				}
-			}
-		})
+func TestPresenceExcludesDisconnectAndRestartGaps(t *testing.T) {
+	dir := t.TempDir()
+	db, admins := filepath.Join(dir, "state.sqlite"), filepath.Join(dir, "admins.json")
+	s, err := openPlayerStore(db, admins)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err = s.recordPresence([]string{"Alice", "ALICE"}, base); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.recordPresence([]string{"alice"}, base.Add(10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a crash: close the database without the orderly disconnect hook.
+	if err = s.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = openPlayerStore(db, admins)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.close()
+	if err = s.recordPresence([]string{"alice"}, base.Add(30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.disconnectPresence(base.Add(30*time.Minute + 5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.disconnectPresence(base.Add(31 * time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := s.retainedStats(context.Background(), "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := stats["alice"]
+	if p == nil || p.OnlineSeconds != 15 || p.Sessions != 2 || p.Online {
+		t.Fatalf("offline gap counted: %+v", p)
 	}
 }
