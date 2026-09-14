@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/url"
 	"sort"
@@ -18,12 +20,14 @@ type lyricLine struct {
 }
 
 type songState struct {
-	State  string `json:"state"`
-	Owner  string `json:"owner,omitempty"`
-	Track  string `json:"track,omitempty"`
-	Artist string `json:"artist,omitempty"`
-	Synced bool   `json:"synced"`
-	Error  string `json:"error,omitempty"`
+	State    string `json:"state"`
+	Owner    string `json:"owner,omitempty"`
+	Track    string `json:"track,omitempty"`
+	Artist   string `json:"artist,omitempty"`
+	Synced   bool   `json:"synced"`
+	Voice    bool   `json:"voice"`
+	Fallback string `json:"fallback,omitempty"`
+	Error    string `json:"error,omitempty"`
 }
 
 type songSession struct {
@@ -31,6 +35,17 @@ type songSession struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
+	voice  *voiceChat
+}
+
+// A song belongs to the Minecraft connection on which it was requested.
+func (a *activities) bindVoice(voice *voiceChat) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.voice != voice && a.song != nil {
+		a.song.cancel()
+	}
+	a.voice = voice
 }
 
 func (a *activities) sing(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
@@ -60,7 +75,7 @@ func (a *activities) sing(ctx context.Context, actor string, raw json.RawMessage
 		return nil, fmt.Errorf("a song is already loading or playing; stop it first")
 	}
 	songCtx, cancel := context.WithCancel(a.ctx)
-	session := &songSession{state: songState{State: "loading", Owner: actor}, ctx: songCtx, cancel: cancel, done: make(chan struct{})}
+	session := &songSession{state: songState{State: "loading", Owner: actor}, ctx: songCtx, cancel: cancel, done: make(chan struct{}), voice: a.voice}
 	a.song = session
 	// Reservation and Add are atomic with close's closed check and Wait.
 	a.wg.Add(1)
@@ -68,7 +83,7 @@ func (a *activities) sing(ctx context.Context, actor string, raw json.RawMessage
 
 	// The initiating request cancels the search, but not successful background playback.
 	stopRequestCancel := context.AfterFunc(ctx, cancel)
-	lyrics, track, artist, synced, err := a.fetchLyrics(songCtx, query)
+	lyrics, track, artist, synced, duration, err := a.fetchLyrics(songCtx, query)
 	stopRequestCancel()
 	if err == nil {
 		err = ctx.Err()
@@ -89,10 +104,9 @@ func (a *activities) sing(ctx context.Context, actor string, raw json.RawMessage
 	session.state.Track = track
 	session.state.Artist = artist
 	session.state.Synced = synced
-	session.state.State = "playing"
 	state := session.state
 	a.mu.Unlock()
-	go func() { a.finishSong(session, a.playSong(session.ctx, lyrics)) }()
+	go func() { a.finishSong(session, a.startSong(session, lyrics, track, artist, duration)) }()
 	return state, nil
 }
 
@@ -164,8 +178,145 @@ func (a *activities) finishSong(session *songSession, err error) {
 	a.wg.Done()
 }
 
-func (a *activities) playSong(ctx context.Context, lyrics []lyricLine) error {
-	start := time.Now()
+func (a *activities) startSong(session *songSession, lyrics []lyricLine, track, artist string, duration time.Duration) error {
+	var voice *voiceSession
+	var audio *songAudio
+	var err error
+	audioCtx, stopAudio := context.WithCancel(session.ctx)
+	defer stopAudio()
+	if session.voice == nil {
+		err = fmt.Errorf("voice chat is not connected")
+	} else {
+		voice, err = session.voice.connect(session.ctx)
+	}
+	if err == nil {
+		audio, err = openSongAudio(audioCtx, track, artist, duration)
+	}
+	if session.ctx.Err() != nil {
+		if audio != nil {
+			_ = audio.Close()
+		}
+		return session.ctx.Err()
+	}
+	a.mu.Lock()
+	session.state.State = "playing"
+	session.state.Voice = err == nil
+	if err != nil {
+		session.state.Fallback = err.Error()
+	}
+	a.mu.Unlock()
+	if err != nil {
+		log.Printf("Singing %q by %s: chat-only fallback: %v", track, artist, err)
+		return a.playSong(session.ctx, lyrics, time.Now())
+	}
+	defer audio.Close()
+	log.Printf("Singing %q by %s over voice chat", track, artist)
+	return a.playVoiceSong(session, lyrics, audio.Next, voice.sendAudio, stopAudio)
+}
+
+// Lyrics follow successfully transmitted audio positions, not media preparation
+// time. Chat backpressure cannot stop the 20ms audio sender.
+func (a *activities) playVoiceSong(session *songSession, lyrics []lyricLine, next func() ([]byte, error), send func([]byte) error, stopAudio context.CancelFunc) error {
+	ctx, cancel := context.WithCancel(session.ctx)
+	progress := make(chan time.Duration, 1)
+	type result struct {
+		at  time.Duration
+		err error
+	}
+	done := make(chan result, 1)
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		at, err := streamSongAudio(ctx, next, send, progress)
+		done <- result{at, err}
+	}()
+	// Join the sender before allowing a replacement song to use this session.
+	defer func() { cancel(); stopAudio(); <-stopped }()
+	for {
+		var at time.Duration
+		var ended *result
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case at = <-progress:
+		case result := <-done:
+			ended = &result
+			at = result.at
+		}
+		for len(lyrics) > 0 && lyrics[0].at <= at {
+			if err := a.send(ctx, lyrics[0].text); err != nil {
+				return fmt.Errorf("send lyrics: %w", err)
+			}
+			lyrics = lyrics[1:]
+		}
+		if ended != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if ended.err != nil {
+				a.mu.Lock()
+				session.state.Voice = false
+				session.state.Fallback = ended.err.Error()
+				a.mu.Unlock()
+				log.Printf("Voice playback stopped; continuing lyrics in chat: %v", ended.err)
+			}
+			// Preserve the current lyric position even if UDP or decoding fails.
+			return a.playSong(ctx, lyrics, time.Now().Add(-at))
+		}
+	}
+}
+
+func streamSongAudio(ctx context.Context, next func() ([]byte, error), send func([]byte) error, progress chan time.Duration) (time.Duration, error) {
+	const frameTime = 20 * time.Millisecond
+	var position time.Duration
+	deadline := time.Now()
+	defer func() { _ = send(nil) }()
+	for {
+		if err := ctx.Err(); err != nil {
+			return position, err
+		}
+		frame, err := next()
+		if errors.Is(err, io.EOF) {
+			return position, waitSongTime(ctx, deadline)
+		}
+		if err != nil {
+			return position, err
+		}
+		if err := waitSongTime(ctx, deadline); err != nil {
+			return position, err
+		}
+		if err := send(frame); err != nil {
+			return position, err
+		}
+		// Keep the latest audio position if chat is busy sending the previous line.
+		select {
+		case <-progress:
+		default:
+		}
+		progress <- position
+		position += frameTime
+		// Never burst overdue packets after a stalled decoder/network read.
+		deadline = deadline.Add(frameTime)
+		if now := time.Now(); deadline.Before(now) {
+			deadline = now.Add(frameTime)
+		}
+	}
+}
+
+func waitSongTime(ctx context.Context, deadline time.Time) error {
+	if delay := time.Until(deadline); delay > 0 {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return ctx.Err()
+}
+
+func (a *activities) playSong(ctx context.Context, lyrics []lyricLine, start time.Time) error {
 	for _, line := range lyrics {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -189,27 +340,28 @@ func (a *activities) playSong(ctx context.Context, lyrics []lyricLine) error {
 	return nil
 }
 
-func (a *activities) fetchLyrics(ctx context.Context, query string) ([]lyricLine, string, string, bool, error) {
+func (a *activities) fetchLyrics(ctx context.Context, query string) ([]lyricLine, string, string, bool, time.Duration, error) {
 	var tracks []struct {
-		Track  string `json:"trackName"`
-		Artist string `json:"artistName"`
-		Synced string `json:"syncedLyrics"`
-		Plain  string `json:"plainLyrics"`
+		Track    string  `json:"trackName"`
+		Artist   string  `json:"artistName"`
+		Synced   string  `json:"syncedLyrics"`
+		Plain    string  `json:"plainLyrics"`
+		Duration float64 `json:"duration"`
 	}
 	if err := a.getJSON(ctx, "https://lrclib.net/api/search?q="+url.QueryEscape(query), &tracks); err != nil {
-		return nil, "", "", false, err
+		return nil, "", "", false, 0, err
 	}
 	for _, track := range tracks {
 		if lyrics := parseLRC(track.Synced); len(lyrics) != 0 {
-			return lyrics, track.Track, track.Artist, true, nil
+			return lyrics, track.Track, track.Artist, true, time.Duration(track.Duration * float64(time.Second)), nil
 		}
 	}
 	for _, track := range tracks {
 		if lyrics := parsePlainLyrics(track.Plain); len(lyrics) != 0 {
-			return lyrics, track.Track, track.Artist, false, nil
+			return lyrics, track.Track, track.Artist, false, time.Duration(track.Duration * float64(time.Second)), nil
 		}
 	}
-	return nil, "", "", false, fmt.Errorf("no usable lyrics found for %q", query)
+	return nil, "", "", false, 0, fmt.Errorf("no usable lyrics found for %q", query)
 }
 
 // LRC permits multiple timestamps per line and fractional seconds of varying precision.

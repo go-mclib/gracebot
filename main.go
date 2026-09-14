@@ -160,8 +160,11 @@ func run(ctx context.Context, cfg config) (result error) {
 	defer saveTicker.Stop()
 	connectionDone := make(chan error, 1)
 	connectionCtx, stopConnection := context.WithCancel(ctx)
-	defer stopConnection()
-	go func() { connectionDone <- connect(connectionCtx, cfg, router, output) }()
+	defer func() { stopConnection(); <-connectionDone }()
+	go func() {
+		defer close(connectionDone)
+		connectionDone <- connect(connectionCtx, cfg, router, output, activities)
+	}()
 	for {
 		select {
 		case err := <-connectionDone:
@@ -177,12 +180,12 @@ func run(ctx context.Context, cfg config) (result error) {
 	}
 }
 
-func connect(ctx context.Context, cfg config, router *chatRouter, output *chatOutput) error {
+func connect(ctx context.Context, cfg config, router *chatRouter, output *chatOutput, activities *activities) error {
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		err := connectOnce(ctx, cfg, router, output)
+		err := connectOnce(ctx, cfg, router, output, activities)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -203,7 +206,7 @@ func connect(ctx context.Context, cfg config, router *chatRouter, output *chatOu
 	}
 }
 
-func connectOnce(ctx context.Context, cfg config, router *chatRouter, output *chatOutput) error {
+func connectOnce(ctx context.Context, cfg config, router *chatRouter, output *chatOutput, activities *activities) error {
 	sessionCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	c := client.New(cfg.address, cfg.username, cfg.online)
@@ -218,6 +221,10 @@ func connectOnce(ctx context.Context, cfg config, router *chatRouter, output *ch
 	c.Register(me)
 	chat := &synchronizedChat{inner: chatmodule.New(), ctx: sessionCtx}
 	c.Register(chat)
+	voice := newVoiceChat()
+	c.Register(voice)
+	defer voice.close()
+	defer activities.bindVoice(nil)
 	players := playerlist.New()
 	c.Register(players)
 	c.Register(registry.New())
@@ -238,10 +245,11 @@ func connectOnce(ctx context.Context, cfg config, router *chatRouter, output *ch
 		chat.ready = true
 		chat.mu.Unlock()
 		output.bind(chat.SendMessage)
+		activities.bindVoice(voice)
 		log.Printf("Listening for current username %q and aliases %q", c.Username, cfg.aliases)
 	})
-	c.OnTransfer(func() { output.bind(nil) })
-	c.OnDisconnect(func() { cancel(); output.bind(nil) })
+	c.OnTransfer(func() { activities.bindVoice(nil); output.bind(nil) })
+	c.OnDisconnect(func() { cancel(); activities.bindVoice(nil); output.bind(nil) })
 	err := c.ConnectAndStart(sessionCtx)
 	if stopClose != nil {
 		stopClose()
