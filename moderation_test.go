@@ -227,3 +227,99 @@ func TestAdminToolBlockRebuildsContextBeforeNextModelCall(t *testing.T) {
 		t.Fatalf("admin block flow: calls=%d replies=%v", calls, replies)
 	}
 }
+
+func TestUnblockHumanReadableDiscordBridgeTarget(t *testing.T) {
+	_, m := moderationFixture(t)
+	at := time.Now()
+	if _, err := m.block(context.Background(), "RealAdmin", discordBridgeActor, "", "1 hour", at); err != nil {
+		t.Fatal(err)
+	}
+	// No recent nicknames: a blocked bridge must remain addressable after restart.
+	if _, err := m.unblock(context.Background(), "RealAdmin", "Discord   bridge", "", at); err != nil {
+		t.Fatal(err)
+	}
+	if m.blocked(discordBridgeActor, at) {
+		t.Fatal("human-readable bridge target left the bridge blocked")
+	}
+	if target, err := m.resolveTarget("Discord", "minecraft", at); err != nil || target != "discord" {
+		t.Fatalf("Minecraft account named Discord collided with the bridge: %q %v", target, err)
+	}
+}
+
+func TestUnblockOutcomeSurvivesModerationContextReset(t *testing.T) {
+	r, m := moderationFixture(t)
+	if _, err := m.block(context.Background(), "RealAdmin", discordBridgeActor, "", "1 hour", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	r.assistant.client = completionFunc(func(_ context.Context, request openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+		calls++
+		if calls == 1 {
+			return completionMessage(openai.ChatCompletionMessage{ToolCalls: []openai.ToolCall{{
+				ID: "unblock", Type: openai.ToolTypeFunction,
+				Function: openai.FunctionCall{Name: "unblock_chat", Arguments: `{"target":"#discord_bridge","source":"discord"}`},
+			}}}), nil
+		}
+		confirmed := false
+		for _, message := range request.Messages {
+			start := strings.IndexByte(message.Content, '{')
+			if start < 0 {
+				continue
+			}
+			var result struct {
+				Actor   string `json:"actor"`
+				Blocked *bool  `json:"blocked"`
+				Changed bool   `json:"changed"`
+			}
+			if json.Unmarshal([]byte(message.Content[start:]), &result) == nil &&
+				result.Actor == discordBridgeActor && result.Blocked != nil && !*result.Blocked && result.Changed {
+				confirmed = true
+			}
+		}
+		if !confirmed {
+			t.Fatal("model lost the actual unblock result when moderation cleared context")
+		}
+		return responseCompletion("continue", "discord is unblocked"), nil
+	})
+	r.assistant.send = func(context.Context, string) error { return nil }
+	r.assistant.handleRequest(context.Background(), fragmentRequest(context.Background(), "RealAdmin", "steeds stop ignoring discord bridge", time.Now(), true, 0))
+	if calls != 2 || m.blocked(discordBridgeActor, time.Now()) {
+		t.Fatalf("unblock flow: calls=%d blocked=%v", calls, m.blocked(discordBridgeActor, time.Now()))
+	}
+}
+
+func TestChatBlockStatusReportsExpiryAndReadErrors(t *testing.T) {
+	_, m := moderationFixture(t)
+	ctx, at := context.Background(), time.Now()
+	block, err := m.block(ctx, "RealAdmin", discordBridgeActor, "", "1 minute", at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, instant := range []time.Time{at, *block.ExpiresAt} {
+		value, err := m.status(ctx, "RealAdmin", "discord bridge", "", instant)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := json.Marshal(value)
+		var status struct {
+			Actor   string      `json:"actor"`
+			Blocked bool        `json:"blocked"`
+			Block   *actorBlock `json:"block"`
+		}
+		if err := json.Unmarshal(data, &status); err != nil {
+			t.Fatal(err)
+		}
+		wantBlocked := instant.Before(*block.ExpiresAt)
+		if status.Actor != discordBridgeActor || status.Blocked != wantBlocked || (status.Block != nil) != wantBlocked {
+			t.Fatalf("status at %v: %s", instant, data)
+		}
+		if wantBlocked && (status.Block.ExpiresAt == nil || !status.Block.ExpiresAt.Equal(*block.ExpiresAt)) {
+			t.Fatalf("active block lost its expiry: %s", data)
+		}
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := m.status(cancelled, "RealAdmin", discordBridgeActor, "", at); err == nil {
+		t.Fatal("failed state lookup reported an unblocked actor")
+	}
+}

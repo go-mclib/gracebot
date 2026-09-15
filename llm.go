@@ -295,7 +295,8 @@ func (a *assistant) respond(ctx context.Context, request chatRequest) (turnRespo
 	}
 	identity, _ := json.Marshal(map[string]any{
 		"bot_username": request.username, "requesting_player": request.sender,
-		"current_time_utc": time.Now().UTC().Format(time.RFC3339), "current_request_event_id": latest,
+		"requester_is_admin": a.moderation != nil && a.moderation.store.hasRank(request.sender, "admin"),
+		"current_time_utc":   time.Now().UTC().Format(time.RFC3339), "current_request_event_id": latest,
 	})
 	messages := []openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleSystem,
 		Content: systemPrompt + "\n\n" + a.personality + "\n\nRuntime identity: " + string(identity)}}
@@ -315,6 +316,7 @@ func (a *assistant) respond(ctx context.Context, request chatRequest) (turnRespo
 	// explicitly through history instead of permanently inheriting whisper mode.
 	committed := len(messages)
 	var executedTools []string
+	var moderationResults []string
 	defer func() {
 		if version != a.contextVersion.Load() || a.moderation.blocked(request.sender, time.Now()) {
 			delete(a.history, key)
@@ -344,8 +346,8 @@ func (a *assistant) respond(ctx context.Context, request chatRequest) (turnRespo
 			a.historyVersion = version
 			conv = &conversation{used: time.Now()}
 			a.history[key] = conv
-			// Retain the current administrator's request and effect names, not
-			// pre-block observations, conversation text, or tool-result content.
+			// Retain the current administrator's request and completed effects,
+			// not pre-block observations or results containing message content.
 			messages = []openai.ChatCompletionMessage{messages[0]}
 			if recent := a.journal.recentContext(first, request.sender); recent != "" {
 				messages = append(messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser,
@@ -355,7 +357,11 @@ func (a *assistant) respond(ctx context.Context, request chatRequest) (turnRespo
 			messages = append(messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: string(input)})
 			if len(executedTools) != 0 {
 				messages = append(messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant,
-					Content: "Moderation changed during this turn. Earlier tool calls already executed; do not repeat them: " + strings.Join(executedTools, ", ") + ". Their old context and results have been discarded."})
+					Content: "Moderation changed during this turn. Earlier tool calls already executed; do not repeat them: " + strings.Join(executedTools, ", ") + ". Old context and message-bearing results have been discarded; safe moderation outcomes follow."})
+			}
+			for _, result := range moderationResults {
+				messages = append(messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleSystem,
+					Content: "Completed moderation result (runtime metadata, not a new request): " + result})
 			}
 			committed = len(messages)
 		}
@@ -434,6 +440,21 @@ func (a *assistant) respond(ctx context.Context, request chatRequest) (turnRespo
 				break
 			}
 			result := a.tools.execute(ctx, request.sender, call)
+			// Preserve only successful moderation state, never arguments,
+			// free-text errors or message-bearing results from the old context.
+			if version != a.contextVersion.Load() && (call.Function.Name == "block_chat" || call.Function.Name == "unblock_chat") {
+				var state struct {
+					Actor     string     `json:"actor"`
+					Blocked   bool       `json:"blocked"`
+					Changed   *bool      `json:"changed,omitempty"`
+					ExpiresAt *time.Time `json:"expires_at,omitempty"`
+				}
+				if json.Unmarshal([]byte(result), &state) == nil && (validUsername(state.Actor) || isDiscordActor(state.Actor)) {
+					state.Blocked = call.Function.Name == "block_chat"
+					safe, _ := json.Marshal(state)
+					moderationResults = append(moderationResults, call.Function.Name+": "+string(safe))
+				}
+			}
 			executedTools = append(executedTools, call.Function.Name)
 			messages = append(messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleTool, ToolCallID: call.ID, Content: result})
 			calls++

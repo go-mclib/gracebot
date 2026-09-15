@@ -151,6 +151,17 @@ func (s *playerStore) actorBlocked(actor string, at time.Time) bool {
 	return err != nil || blocked
 }
 
+func (s *playerStore) activeActorBlock(ctx context.Context, actor string, at time.Time) (*actorBlock, error) {
+	block, err := scanActorBlock(s.db.QueryRowContext(ctx, "SELECT actor,by_actor,reason,created_at,expires_at FROM actor_blocks WHERE actor=? AND (expires_at IS NULL OR expires_at>?)", actor, at.UnixNano()))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &block, nil
+}
+
 func (s *playerStore) blockedActors(ctx context.Context, at time.Time) ([]actorBlock, error) {
 	rows, err := s.db.QueryContext(ctx, "SELECT actor,by_actor,reason,created_at,expires_at FROM actor_blocks WHERE expires_at IS NULL OR expires_at>? ORDER BY actor", at.UnixNano())
 	if err != nil {

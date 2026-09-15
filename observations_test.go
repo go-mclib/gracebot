@@ -92,6 +92,34 @@ func TestObservationLoadedRangeEquipmentAndReset(t *testing.T) {
 	if slots["mainhand"].(map[string]any)["name"] != "minecraft:diamond_sword" || slots["offhand"] != nil {
 		t.Fatalf("equipment = %v", equipment)
 	}
+	// An ordinary held-slot change must replace equipment on the same tracked
+	// entity, without another spawn or chunk load.
+	o.session.entities.HandlePacket(observationPacket(t, &packets.S2CSetEquipment{EntityId: 42, Slots: []packets.EquipmentEntry{
+		{Slot: 0, Item: ns.NewSlot(ns.VarInt(items.ItemID("minecraft:iron_axe")), 1)},
+		{Slot: 5, Item: ns.NewSlot(ns.VarInt(items.ItemID("minecraft:iron_helmet")), 1)},
+	}}))
+	value, err = o.playerEquipmentTool(context.Background(), "Steve", json.RawMessage(`{}`))
+	updated := observationResultMap(t, value, err)["slots"].(map[string]any)
+	if updated["mainhand"].(map[string]any)["name"] != "minecraft:iron_axe" || updated["head"].(map[string]any)["name"] != "minecraft:iron_helmet" {
+		t.Fatalf("equipment replacement was not visible: %v", updated)
+	}
+	o.session.entities.HandlePacket(observationPacket(t, &packets.S2CEntityEvent{EntityId: 42, EntityStatus: 55}))
+	value, err = o.playerEquipmentTool(context.Background(), "Steve", json.RawMessage(`{}`))
+	swapped := observationResultMap(t, value, err)["slots"].(map[string]any)
+	if swapped["mainhand"] != nil || swapped["offhand"].(map[string]any)["name"] != "minecraft:iron_axe" {
+		t.Fatalf("hand swap left stale equipment: %v", swapped)
+	}
+	o.session.entities.HandlePacket(observationPacket(t, &packets.S2CSetEquipment{EntityId: 42, Slots: []packets.EquipmentEntry{
+		{Slot: 0, Item: ns.NewSlot(ns.VarInt(items.ItemID("minecraft:diamond_pickaxe")), 1)},
+		{Slot: 5, Item: ns.EmptySlot()},
+	}}))
+	value, err = o.playerEquipmentTool(context.Background(), "Steve", json.RawMessage(`{}`))
+	cleared := observationResultMap(t, value, err)["slots"].(map[string]any)
+	if cleared["mainhand"].(map[string]any)["name"] != "minecraft:diamond_pickaxe" ||
+		cleared["head"].(map[string]any)["count"] != float64(0) ||
+		cleared["offhand"].(map[string]any)["name"] != "minecraft:iron_axe" {
+		t.Fatalf("partial update after swap lost current equipment: %v", cleared)
+	}
 	unload := observationPacket(t, &packets.S2CForgetLevelChunk{})
 	o.session.world.HandlePacket(unload)
 	o.session.entities.HandlePacket(unload)

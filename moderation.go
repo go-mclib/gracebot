@@ -162,7 +162,8 @@ func (m *chatModeration) resolveTarget(target, source string, at time.Time) (str
 	if source != "" && source != "minecraft" && source != "discord" {
 		return "", errors.New("source must be minecraft or discord")
 	}
-	if source == "discord" || strings.EqualFold(target, discordBridgeActor) || strings.HasPrefix(strings.ToLower(target), "discord:") {
+	bridgeName := strings.EqualFold(strings.Join(strings.Fields(target), " "), "discord bridge")
+	if source == "discord" || bridgeName || strings.EqualFold(target, discordBridgeActor) || strings.HasPrefix(strings.ToLower(target), "discord:") {
 		if source == "minecraft" {
 			return "", errors.New("Discord cannot be targeted as a Minecraft account")
 		}
@@ -270,11 +271,26 @@ func (m *chatModeration) unblock(ctx context.Context, actor, target, source stri
 	return map[string]any{"actor": target, "blocked": false, "changed": changed}, nil
 }
 
+func (m *chatModeration) status(ctx context.Context, actor, target, source string, at time.Time) (any, error) {
+	if !m.store.hasRank(actor, "admin") {
+		return nil, errors.New("administrator authority required")
+	}
+	target, err := m.resolveTarget(target, source, at)
+	if err != nil {
+		return nil, err
+	}
+	block, err := m.store.activeActorBlock(ctx, target, at)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"actor": target, "blocked": block != nil, "block": block}, nil
+}
+
 func (m *chatModeration) tools() []toolSpec {
-	target := map[string]any{"type": "string", "description": "Minecraft account name, #discord_bridge, or Discord nickname with source=discord. Blocking any Discord speaker blocks the entire bridge."}
+	target := map[string]any{"type": "string", "description": "Minecraft account name, #discord_bridge (also 'discord bridge'), or Discord nickname with source=discord. Moderating any Discord speaker affects the entire bridge, including unseen or renamed nicknames."}
 	source := map[string]any{"type": "string", "enum": []string{"minecraft", "discord"}, "description": "Specify the source for names that could collide. Discord nicknames never authorize Minecraft actions."}
 	return []toolSpec{
-		makeTool("block_chat", "Admin-only: make a speaker invisible to chat/context/history. Default permanent; duration accepts e.g. 10 minutes, 2 hours, 7 days. Targeting Discord blocks the entire bridge. Use only when an authenticated admin requests it; automatic spam timeouts are enforced separately.", map[string]any{"target": target, "source": source, "duration": map[string]any{"type": "string"}}, []string{"target"}, func(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
+		makeTool("block_chat", "Admin-only: ignore, block or time out a speaker by making their messages invisible to chat/context/history. Use for requests to ignore messages, not a conversational promise. Default permanent; duration accepts e.g. 10 minutes, 2 hours, 7 days. Targeting Discord blocks the entire bridge. Use only when an authenticated admin requests it; automatic spam timeouts are enforced separately.", map[string]any{"target": target, "source": source, "duration": map[string]any{"type": "string"}}, []string{"target"}, func(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
 			var args struct {
 				Target   string `json:"target"`
 				Source   string `json:"source"`
@@ -285,7 +301,7 @@ func (m *chatModeration) tools() []toolSpec {
 			}
 			return m.block(ctx, actor, args.Target, args.Source, args.Duration, time.Now())
 		}),
-		makeTool("unblock_chat", "Admin-only: remove a permanent or temporary chat block. Unblocking a Discord nickname unblocks the entire #discord_bridge. Previously discarded messages cannot be recovered.", map[string]any{"target": target, "source": source}, []string{"target"}, func(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
+		makeTool("unblock_chat", "Admin-only: unignore, stop ignoring, listen to again, or unblock a speaker by removing their permanent or temporary chat block. Requires a current explicit request to stop ignoring; a question about whether someone is ignored authorizes only chat_block_status, not unblocking. For 'stop ignoring Discord [bridge]', call with target=#discord_bridge and source=discord, even if no Discord messages are visible. A verbal reply does not unblock anything. Unblocking a Discord nickname unblocks the entire bridge. Previously discarded messages cannot be recovered.", map[string]any{"target": target, "source": source}, []string{"target"}, func(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
 			var args struct {
 				Target string `json:"target"`
 				Source string `json:"source"`
@@ -294,6 +310,16 @@ func (m *chatModeration) tools() []toolSpec {
 				return nil, err
 			}
 			return m.unblock(ctx, actor, args.Target, args.Source, time.Now())
+		}),
+		makeTool("chat_block_status", "Admin-only: check the actual current ignore/block/timeout state of a speaker, including expiry and who blocked them. Use for questions such as 'are you ignoring Discord?'; never infer moderation state from missing messages or conversation history. A status question does not authorize changing the block, even if the result contradicts an earlier reply. For Discord [bridge], target=#discord_bridge and source=discord. Does not change the block.", map[string]any{"target": target, "source": source}, []string{"target"}, func(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
+			var args struct {
+				Target string `json:"target"`
+				Source string `json:"source"`
+			}
+			if err := decodeArgs(raw, &args); err != nil {
+				return nil, err
+			}
+			return m.status(ctx, actor, args.Target, args.Source, time.Now())
 		}),
 	}
 }
