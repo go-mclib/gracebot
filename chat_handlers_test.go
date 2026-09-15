@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-mclib/client"
 	"github.com/go-mclib/client/modules/playerlist"
+	"github.com/go-mclib/client/modules/protocol"
+	"github.com/go-mclib/client/modules/registry"
 	"github.com/go-mclib/data/packet_ids"
 	"github.com/go-mclib/data/packets"
 	"github.com/go-mclib/nbt"
@@ -226,6 +229,80 @@ func TestDiscordBridgeTrustBoundaryAndSelfEcho(t *testing.T) {
 	request, _, ready := a.engagements.take(time.Now().Add(3 * time.Second))
 	if !ready || request.sender != "Alice" || request.messages[0].Text != "[Discord] RealAdmin » grace hello" {
 		t.Fatalf("player body impersonated a Discord actor: %+v", request)
+	}
+}
+
+func TestPlayerHeadChatRoutesAuthenticatedBody(t *testing.T) {
+	// Vanilla 26.2 encoded unsigned content: [Member] [Alice head] Alice » hey grace.
+	// The real packet sender below is Bob; decoration must not supply identity/body.
+	decoration, err := base64.StdEncoding.DecodeString("CgkABWV4dHJhCgAAAAQIAAAACVtNZW1iZXJdIAAIAAAAASAACgAGcGxheWVyCAAEbmFtZQAFQWxpY2UAAAgAAAATIEFsaWNlIMK7IGhleSBncmFjZQAIAAR0ZXh0AAAA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := testPlayerStore(t)
+	a := newAssistant(nil, "model", "", newToolRegistry(), nil)
+	defer a.engagements.reset()
+	r := chatRouter{assistant: a, store: store, journal: store.history(), aliases: parseAliases("grace")}
+	c := client.New("unused", "GraceLocal", false)
+	proto, registries, players := protocol.New(), registry.New(), playerlist.New()
+	c.Register(proto)
+	c.Register(registries)
+	c.Register(players)
+	if err := registries.Wire(); err != nil {
+		t.Fatal(err)
+	}
+	c.SetState(jp.StateConfiguration)
+	wire, err := jp.ToWire(&packets.S2CRegistryData{
+		RegistryId: "minecraft:chat_type",
+		Entries:    []packets.RegistryEntry{{EntryId: "minecraft:chat"}, {EntryId: "minecraft:msg_command_incoming"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proto.HandlePacket(wire)
+	c.SetState(jp.StatePlay)
+	sender := ns.UUID{1}
+	info := ns.NewWriter()
+	_ = info.WriteByte(1) // ADD_PLAYER
+	_ = info.WriteVarInt(1)
+	_ = info.WriteUUID(sender)
+	_ = info.WriteString("Bob")
+	_ = info.WriteVarInt(0) // Profile properties
+	players.HandlePacket(&jp.WirePacket{PacketID: packet_ids.S2CPlayerInfoUpdateID, Data: info.Bytes()})
+	handler := r.handler(context.Background(), players)
+	send := func(uuid ns.UUID, body string, chatType ns.VarInt) {
+		t.Helper()
+		buf := ns.NewWriter()
+		_ = buf.WriteVarInt(0) // Global message index
+		_ = buf.WriteUUID(uuid)
+		_ = buf.WriteVarInt(0)   // Sender's message index
+		_ = buf.WriteBool(false) // No signature
+		_ = buf.WriteString(ns.String(body))
+		_ = buf.WriteInt64(0)   // Timestamp
+		_ = buf.WriteInt64(0)   // Salt
+		_ = buf.WriteVarInt(0)  // Last-seen signatures
+		_ = buf.WriteBool(true) // Unsigned content
+		_, _ = buf.Write(decoration)
+		_ = buf.WriteVarInt(0) // Pass-through filter
+		_ = buf.WriteVarInt(chatType + 1)
+		_ = buf.WriteTextComponent(ns.NewTextComponent("Alice"))
+		_ = buf.WriteBool(false) // No target name
+		handler(c, &jp.WirePacket{PacketID: packet_ids.S2CPlayerChatID, Data: buf.Bytes()})
+	}
+	send(sender, "ordinary public conversation", 0)
+	if _, _, ready := a.engagements.take(time.Now().Add(3 * time.Second)); ready {
+		t.Fatal("mention in unsigned decoration started engagement")
+	}
+	send(sender, "grace, this is the real body", 0)
+	request, _, ready := a.engagements.take(time.Now().Add(3 * time.Second))
+	if !ready || request.sender != "Bob" || len(request.messages) != 1 || request.messages[0].Text != "grace, this is the real body" {
+		t.Fatalf("decorated player packet lost authenticated identity/body: %+v", request)
+	}
+	a.engagements.finish(request, "disengage")
+	send(sender, "grace, private body", 1)
+	send(ns.UUID{2}, "grace, unknown sender", 0)
+	if _, _, ready := a.engagements.take(time.Now().Add(3 * time.Second)); ready {
+		t.Fatal("private or unknown player packet reached public engagement")
 	}
 }
 

@@ -3,10 +3,10 @@ module github.com/go-mclib/gracebot
 go 1.26.0
 
 require (
-	github.com/go-mclib/client v0.0.0-20260915045202-e6b32600ad4e
+	github.com/go-mclib/client v0.0.0-20260915052706-8eeeb80755c5
 	github.com/go-mclib/data v0.0.0-20260915044945-8957c18fe1a8
 	github.com/go-mclib/nbt v0.0.0
-	github.com/go-mclib/protocol v0.0.0-20260915044803-070acbb8d0aa
+	github.com/go-mclib/protocol v0.0.0-20260915052648-6c01ecdcc533
 	github.com/sashabaranov/go-openai v1.41.2
 	golang.org/x/net v0.59.0
 	modernc.org/sqlite v1.58.0
