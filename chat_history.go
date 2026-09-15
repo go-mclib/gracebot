@@ -36,13 +36,13 @@ type chatEntry struct {
 type chatHistory struct{ store *playerStore }
 
 func validChatKind(kind string) bool {
-	return slices.Contains([]string{"player", "bot", "system", "disguised", "private", "private_disguised", "console", "command_request", "command_feedback", "death"}, kind)
+	return slices.Contains([]string{"player", "discord", "bot", "system", "disguised", "private", "private_disguised", "console", "command_request", "command_feedback", "death"}, kind)
 }
 func privateChatKind(kind string) bool {
 	return kind == "private" || kind == "private_disguised" || kind == "console" || kind == "command_request" || kind == "command_feedback"
 }
 func chatVisibleTo(e chatEntry, actor string) bool {
-	return e.Owner == "" && !privateChatKind(e.Kind) || e.Owner != "" && e.Owner == normalizeStoreName(actor)
+	return e.Owner == "" && !privateChatKind(e.Kind) || !isDiscordActor(actor) && e.Owner != "" && e.Owner == normalizeStoreName(actor)
 }
 func validChatTime(at time.Time) bool {
 	return at.Year() >= 1970 && at.Year() <= 2200
@@ -53,6 +53,9 @@ func validateChatEntry(e *chatEntry) error {
 		return errors.New("invalid chat entry")
 	}
 	e.At = e.At.UTC()
+	if e.Kind == "discord" && (!isDiscordActor(e.Sender) || e.Owner != "") {
+		return errors.New("Discord chat requires a public namespaced sender")
+	}
 	if e.Kind == "player" || e.Kind == "private" || e.Kind == "death" {
 		name, err := storePlayerName(e.Sender)
 		if err != nil {
@@ -189,9 +192,12 @@ func (h *chatHistory) search(ctx context.Context, actor string, raw json.RawMess
 	if a.Since != nil && !validChatTime(*a.Since) || a.Until != nil && !validChatTime(*a.Until) {
 		return nil, errors.New("history timestamps must be between years 1970 and 2200")
 	}
-	actor, err := storageActor(actor)
-	if err != nil {
-		return nil, err
+	var err error
+	if !isDiscordActor(actor) {
+		actor, err = storageActor(actor)
+		if err != nil {
+			return nil, err
+		}
 	}
 	cutoff := historyCutoff(time.Now())
 	if a.Since != nil && a.Since.After(cutoff) {
@@ -202,14 +208,17 @@ func (h *chatHistory) search(ctx context.Context, actor string, raw json.RawMess
 	}
 	query := "SELECT " + eventColumns + " FROM events WHERE at>=? AND (owner='' OR owner=?)"
 	params := []any{cutoff.UnixNano(), actor}
-	if publicOnly, _ := ctx.Value(publicHistoryKey{}).(bool); publicOnly {
+	if publicOnly, _ := ctx.Value(publicHistoryKey{}).(bool); publicOnly || isDiscordActor(actor) {
 		query = "SELECT " + eventColumns + " FROM events WHERE at>=? AND owner=''"
 		params = []any{cutoff.UnixNano()}
 	}
 	if a.Player != "" {
-		name, err := storageActor(a.Player)
-		if err != nil {
-			return nil, err
+		name := a.Player
+		if !isDiscordActor(name) {
+			name, err = storageActor(name)
+			if err != nil {
+				return nil, err
+			}
 		}
 		query += " AND sender=? COLLATE NOCASE"
 		params = append(params, name)

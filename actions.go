@@ -574,9 +574,6 @@ func (j *actionJob) followTick(fight bool) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if fight && (e.TypeName == "minecraft:player" || e.TypeName == "player") {
-		return false, fmt.Errorf("policy: attacking players is disabled, including for trusted actors")
-	}
 	s.mu.Lock()
 	dead := s.deadEntities[e.ID]
 	s.mu.Unlock()
@@ -752,7 +749,7 @@ func (m *actionManager) tools() []toolSpec {
 			return m.submit(ctx, actor, "move", &actionJob{goal: actionPoint{*a.X, *a.Y, *a.Z}, seconds: a.Seconds})
 		}),
 		makeTool("follow_entity", "Follow one loaded entity or visible player algorithmically for at most 120 seconds/32-block radius. Trusted only. Target unload terminates the job.", targetProps(), nil, m.targetTool("follow")),
-		makeTool("fight_entity", "Trusted-only autonomous fight of one loaded non-player entity, with navigation, line of sight, reach and held-item attack cooldown. Player attacks are always disabled. Removal is not reported as a kill.", targetProps(), nil, m.targetTool("fight")),
+		makeTool("fight_entity", "Trusted-only autonomous fight of one loaded mob or player, selected by entity_id or visible player name, with navigation, line of sight, reach and held-item attack cooldown. Server PvP rules still apply. Attacks are not confirmed damage; removal is not proof of a kill.", targetProps(), nil, m.targetTool("fight")),
 		makeTool("mount_entity", "Trusted-only mount of a loaded boat/raft or rideable minecart, with navigation, empty hand and server passenger confirmation.", targetProps(), nil, m.targetTool("mount")),
 		makeTool("dismount", "Trusted-only dismount using real shift input; requires server passenger confirmation.", nil, nil, func(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
 			if err := decodeArgs(raw, &struct{}{}); err != nil {

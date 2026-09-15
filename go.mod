@@ -3,9 +3,10 @@ module github.com/go-mclib/gracebot
 go 1.26.0
 
 require (
-	github.com/go-mclib/client v0.0.0-20260914124914-84022fcb18db
-	github.com/go-mclib/data v0.0.0-20260914124408-f099c6bbc8f1
-	github.com/go-mclib/protocol v0.0.0-20260721202818-10261fbb8e79
+	github.com/go-mclib/client v0.0.0-20260915045202-e6b32600ad4e
+	github.com/go-mclib/data v0.0.0-20260915044945-8957c18fe1a8
+	github.com/go-mclib/nbt v0.0.0
+	github.com/go-mclib/protocol v0.0.0-20260915044803-070acbb8d0aa
 	github.com/sashabaranov/go-openai v1.41.2
 	golang.org/x/net v0.59.0
 	modernc.org/sqlite v1.58.0
@@ -26,7 +27,6 @@ require (
 	github.com/clipperhouse/uax29/v2 v2.3.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
-	github.com/go-mclib/nbt v0.0.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect

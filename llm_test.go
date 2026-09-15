@@ -245,8 +245,9 @@ func TestPrivateToolDataCannotEscapeThroughCurrentOrCachedReplies(t *testing.T) 
 			defer commands.close()
 			out := newChatOutput()
 			out.interval, out.journal = 0, journal
-			out.bind(func(context.Context, string) error {
-				t.Fatal("private model output reached the public transport")
+			var published []string
+			out.bind(func(_ context.Context, text string) error {
+				published = append(published, text)
 				return nil
 			}, "GraceLocal")
 			var whispered []string
@@ -261,7 +262,7 @@ func TestPrivateToolDataCannotEscapeThroughCurrentOrCachedReplies(t *testing.T) 
 			api := completionFunc(func(_ context.Context, request openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
 				calls++
 				data, _ := json.Marshal(request.Messages)
-				if calls == 1 {
+				if calls == 1 || calls == 4 {
 					if strings.Contains(string(data), secret) {
 						t.Fatal("automatic background exposed private data before retrieval")
 					}
@@ -270,6 +271,12 @@ func TestPrivateToolDataCannotEscapeThroughCurrentOrCachedReplies(t *testing.T) 
 						Function: openai.FunctionCall{Name: source.tool, Arguments: source.arguments},
 					}}}), nil
 				}
+				if calls == 3 {
+					if strings.Contains(string(data), secret) {
+						t.Fatal("private result or reply leaked into a later public turn")
+					}
+					return responseCompletion("continue", "yes im here"), nil
+				}
 				if !strings.Contains(string(data), secret) {
 					t.Fatal("private result was not available to its owner")
 				}
@@ -277,8 +284,11 @@ func TestPrivateToolDataCannotEscapeThroughCurrentOrCachedReplies(t *testing.T) 
 			})
 			a := newAssistant(api, "model", "", newToolRegistry(store.tools(), journal.tools(), commands.tools()), out.sendMessage)
 			a.journal = journal
-			for i := range 2 {
-				a.handleRequest(context.Background(), fragmentRequest(context.Background(), "Alice", "what did i save", time.Now(), true, uint64(i+1)))
+			a.handleRequest(context.Background(), fragmentRequest(context.Background(), "Alice", "what did i save", time.Now(), true, 1))
+			a.handleRequest(context.Background(), fragmentRequest(context.Background(), "Alice", "please answer publicly are you there", time.Now(), true, 2))
+			a.handleRequest(context.Background(), fragmentRequest(context.Background(), "Alice", "what did i save again", time.Now(), true, 3))
+			if !reflect.DeepEqual(published, []string{"yes im here"}) {
+				t.Fatalf("private tool data stuck later replies in whispers or escaped publicly: %q", published)
 			}
 			if !reflect.DeepEqual(whispered, []string{secret, secret}) {
 				t.Fatalf("owner did not receive both private replies: %q", whispered)
@@ -298,5 +308,45 @@ func TestPrivateToolDataCannotEscapeThroughCurrentOrCachedReplies(t *testing.T) 
 				t.Fatal("missing private transport did not fail closed")
 			}
 		})
+	}
+}
+
+func TestRequestedAudienceCanReturnFromWhispersToPublicChat(t *testing.T) {
+	store := testPlayerStore(t)
+	out := newChatOutput()
+	out.interval, out.journal = 0, store.history()
+	var public, private []string
+	out.bind(func(_ context.Context, text string) error {
+		public = append(public, text)
+		return nil
+	}, "GraceLocal")
+	out.bindWhisper(func(_ context.Context, actor, text string) error {
+		if actor != "Alice" {
+			t.Fatalf("whisper addressed to %q", actor)
+		}
+		private = append(private, text)
+		return nil
+	})
+	calls := 0
+	api := completionFunc(func(ctx context.Context, _ openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+		calls++
+		audience, text := "private", "a private hello"
+		if calls == 2 {
+			// A private lookup this turn must not prevent the owner from
+			// explicitly requesting a non-sensitive public acknowledgment.
+			privateToolData(ctx)
+			audience, text = "public", "back in public chat"
+		}
+		raw, _ := json.Marshal(turnResponse{Decision: "continue", Messages: []string{text}, Audience: audience})
+		return completionMessage(openai.ChatCompletionMessage{ToolCalls: []openai.ToolCall{{
+			ID: "reply", Type: openai.ToolTypeFunction, Function: openai.FunctionCall{Name: "respond", Arguments: string(raw)},
+		}}}), nil
+	})
+	a := newAssistant(api, "model", "", newToolRegistry(), out.sendMessage)
+	a.journal = store.history()
+	a.handleRequest(context.Background(), fragmentRequest(context.Background(), "Alice", "whisper hello to me", time.Now(), true, 1))
+	a.handleRequest(context.Background(), fragmentRequest(context.Background(), "Alice", "stop using msg and reply publicly", time.Now(), true, 2))
+	if !reflect.DeepEqual(private, []string{"a private hello"}) || !reflect.DeepEqual(public, []string{"back in public chat"}) {
+		t.Fatalf("audience switch failed: private=%q public=%q", private, public)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,7 @@ import (
 	chatmodule "github.com/go-mclib/client/modules/chat"
 	"github.com/go-mclib/client/modules/playerlist"
 	"github.com/go-mclib/client/modules/registry"
+	"github.com/go-mclib/data/lang"
 	"github.com/go-mclib/data/packet_ids"
 	"github.com/go-mclib/data/packets"
 	jp "github.com/go-mclib/protocol/java_protocol"
@@ -43,6 +45,54 @@ func mentioned(message, username string, aliases []string) bool {
 		}
 	}
 	return false
+}
+
+var discordChatPattern = regexp.MustCompile(`^\[Discord\][\p{Zs}]+([^»\r\n]+?)[\p{Zs}]+»[\p{Zs}]+((?s:.+))$`)
+
+const discordActorPrefix = "@discord:"
+
+func normalizeDiscordNickname(nickname string) string {
+	if !utf8.ValidString(nickname) {
+		return ""
+	}
+	for _, r := range nickname {
+		if unicode.IsControl(r) {
+			return ""
+		}
+	}
+	nickname = strings.ToLower(strings.Join(strings.Fields(nickname), " "))
+	if nickname == "" || len(discordActorPrefix)+len(nickname) > 128 {
+		return ""
+	}
+	return nickname
+}
+
+func isDiscordActor(actor string) bool {
+	nickname, ok := strings.CutPrefix(actor, discordActorPrefix)
+	return ok && nickname != "" && normalizeDiscordNickname(nickname) == nickname
+}
+
+// Only system-chat packets may enter this bridge path. A nickname is an
+// unprivileged conversation label, never a Minecraft account or private owner.
+func (r *chatRouter) discordChat(ctx context.Context, username, text string, at time.Time) bool {
+	match := discordChatPattern.FindStringSubmatch(text)
+	if match == nil {
+		return false
+	}
+	nickname := normalizeDiscordNickname(match[1])
+	if nickname == "" || strings.TrimSpace(match[2]) == "" {
+		return false
+	}
+	if ctx.Err() != nil || nickname == normalizeDiscordNickname(username) {
+		return true
+	}
+	actor := discordActorPrefix + nickname
+	id, err := r.journal.append("discord", actor, match[2], at)
+	if err != nil {
+		log.Printf("record Discord chat: %v", err)
+	}
+	r.enqueue(ctx, username, actor, match[2], id, at, mentioned(match[2], username, r.aliases))
+	return true
 }
 
 type chatRouter struct {
@@ -156,7 +206,10 @@ func (r *chatRouter) handler(ctx context.Context, players *playerlist.Module) cl
 			if bool(packet.Overlay) {
 				return
 			}
-			text, at := packet.Content.String(), time.Now()
+			text, at := packet.Content.Render(lang.Translate), time.Now()
+			if r.discordChat(ctx, c.Username, text, at) {
+				return
+			}
 			if strings.HasPrefix(packet.Content.Translate, "death.") && len(packet.Content.With) > 0 {
 				r.rememberContext("system", "", text)
 				if err := r.store.recordDeath(packet.Content.With[0].String(), packet.Content.Translate); err != nil {
@@ -277,7 +330,7 @@ func (m *synchronizedChat) HandlePacket(packet *jp.WirePacket) {
 	// Match the inner chat module's packet set: chunk/entity traffic must not
 	// allocate chat deadlines or contend with the signing state.
 	switch packet.PacketID {
-	case packet_ids.S2CCommandsID, packet_ids.S2CPlayerChatID, packet_ids.S2CSystemChatID, packet_ids.S2CDisguisedChatID:
+	case packet_ids.S2CCommandsID, packet_ids.S2CCommandSuggestionsID, packet_ids.S2CPlayerChatID, packet_ids.S2CSystemChatID, packet_ids.S2CDisguisedChatID:
 	default:
 		return
 	}
@@ -315,6 +368,25 @@ func (m *synchronizedChat) sendCommand(ctx context.Context, command string, expe
 		return err
 	}
 	return m.inner.SendCommand(command)
+}
+func (m *synchronizedChat) completeCommand(ctx context.Context, input string, expected *jp.Conn) (packets.S2CCommandSuggestions, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(m.ctx, cancel)
+	defer stop()
+	release, err := m.acquire(ctx)
+	if err != nil {
+		return packets.S2CCommandSuggestions{}, err
+	}
+	err = m.connected(expected)
+	release()
+	if err != nil {
+		return packets.S2CCommandSuggestions{}, err
+	}
+	// The SDK owns correlation and session synchronization. In particular, do not
+	// hold gate while waiting: HandlePacket needs it to deliver the response.
+	// Recheck the captured transport in the SDK's submission critical section.
+	return m.inner.SuggestCommandContextForConnection(ctx, input, expected)
 }
 func (m *synchronizedChat) connected(expected *jp.Conn) error {
 	if !m.ready || m.ctx.Err() != nil {
@@ -430,7 +502,7 @@ func (o *chatOutput) sendChunks(ctx context.Context, chunks []string) error {
 			return fmt.Errorf("Minecraft chat is disconnected")
 		}
 		owner := ""
-		if scope := replyScope(ctx); scope != nil && scope.private.Load() {
+		if scope := replyScope(ctx); scope != nil && scope.privateReply() {
 			owner = scope.actor
 			if owner == consoleActor || owner == "@server" {
 				log.Printf("PRIVATE %s: %s", owner, chunk)

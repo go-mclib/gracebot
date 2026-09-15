@@ -25,6 +25,7 @@ import (
 	"github.com/go-mclib/client/modules/self"
 	"github.com/go-mclib/client/modules/world"
 	"github.com/go-mclib/data"
+	"github.com/go-mclib/data/packets"
 	"github.com/sashabaranov/go-openai"
 )
 
@@ -312,6 +313,9 @@ func connectOnce(ctx context.Context, cfg config, router *chatRouter, output *ch
 		})
 		router.commands.bind(func(ctx context.Context, command string) error { return chat.sendCommand(ctx, command, conn) })
 		router.commands.bindDiscovery(chat.commands)
+		router.commands.bindCompletion(func(ctx context.Context, input string) (packets.S2CCommandSuggestions, error) {
+			return chat.completeCommand(ctx, input, conn)
+		})
 		activities.bindVoice(voice)
 		log.Printf("Listening for current username %q and aliases %q", c.Username, cfg.aliases)
 	})

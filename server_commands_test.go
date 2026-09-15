@@ -8,6 +8,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-mclib/data/packets"
+	ns "github.com/go-mclib/protocol/java_protocol/net_structures"
 )
 
 func commandStore(t *testing.T) *playerStore {
@@ -52,6 +55,41 @@ func TestServerCommandSafetyAndAuthority(t *testing.T) {
 	if !stopped {
 		t.Fatal("mutating command did not stop physical action")
 	}
+}
+func TestDiscordCommandsCannotCaptureButCanDiscover(t *testing.T) {
+	s := newServerCommands(commandStore(t))
+	s.window = time.Millisecond
+	s.bind(func(context.Context, string) error {
+		t.Error("Discord command reached the Minecraft transport")
+		return nil
+	})
+	defer s.close()
+	s.bindDiscovery(func(context.Context) ([]string, error) {
+		return []string{"help", "time"}, nil
+	})
+	for _, command := range []string{"help", "time query daytime"} {
+		if _, err := s.execute(context.Background(), "@discord:alice", command); err == nil {
+			t.Fatalf("Discord command was accepted: %q", command)
+		}
+		if s.observe("public system chat after rejected request", time.Now()) {
+			t.Fatal("rejected Discord command captured public system chat")
+		}
+	}
+	for _, spec := range s.tools() {
+		if spec.name != "discover_server_commands" {
+			continue
+		}
+		value, err := spec.run(context.Background(), "@discord:alice", json.RawMessage(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		commands := value.(map[string]any)["commands"].([]string)
+		if strings.Join(commands, ",") != "help,time" {
+			t.Fatalf("Discord discovery did not return the advertised commands: %v", commands)
+		}
+		return
+	}
+	t.Fatal("public command discovery tool is unavailable")
 }
 func TestServerCommandPrivateFeedbackAndBounds(t *testing.T) {
 	store := commandStore(t)
@@ -187,5 +225,218 @@ func TestCommandCancelledWhileWaitingForChatTransport(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("cancelled command remained stuck behind a chat operation")
+	}
+}
+
+func TestServerCompletionAuthorityExactInputAndPrivacy(t *testing.T) {
+	store := commandStore(t)
+	s := newServerCommands(store)
+	s.bind(func(context.Context, string) error {
+		t.Error("completion executed a command")
+		return nil
+	})
+	defer s.close()
+	s.BeforeMutation = func() { t.Error("completion interrupted movement") }
+	expected := "/pw "
+	calls := 0
+	s.bindCompletion(func(ctx context.Context, input string) (packets.S2CCommandSuggestions, error) {
+		calls++
+		if input != expected {
+			t.Errorf("completion input changed: %q, want %q", input, expected)
+		}
+		if s.capturing() || s.observe("ordinary public system message", time.Now()) {
+			t.Error("completion installed command feedback capture")
+		}
+		if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > commandSuggestionTimeout {
+			t.Error("completion callback is not time bounded")
+		}
+		length := ns.VarInt(0)
+		if input == "/pw 🌍a" {
+			length = 3
+		}
+		return packets.S2CCommandSuggestions{Start: 4, Length: length, Matches: []packets.CommandSuggestion{{
+			Text: "private-warp ",
+			Tooltip: ns.PrefixedOptional[ns.TextComponent]{Present: true, Value: ns.TextComponent{
+				Text: "Private", Extra: []ns.TextComponent{{Text: " warp"}},
+			}},
+		}}}, nil
+	})
+	var completion toolSpec
+	for _, spec := range s.tools() {
+		if spec.name == "complete_server_command" {
+			completion = spec
+		}
+	}
+	if completion.run == nil {
+		t.Fatal("completion tool is not registered")
+	}
+	for _, actor := range []string{"Alice", "@discord:alice", "@discord:console", "@server", ""} {
+		if _, err := completion.run(context.Background(), actor, json.RawMessage(`{"input":"/pw "}`)); err == nil {
+			t.Errorf("unauthorized actor accepted: %q", actor)
+		}
+	}
+	if calls != 0 {
+		t.Fatal("unauthorized completion reached transport")
+	}
+	if _, err := store.setRankTool(context.Background(), consoleActor, json.RawMessage(`{"player":"Alice","rank":"trusted","action":"add"}`)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, _ := scopedTurn(context.Background(), "Alice")
+	value, err := completion.run(ctx, "Alice", json.RawMessage(`{"input":"/pw "}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := value.(commandCompletionResult)
+	if calls != 1 || r.Input != expected || r.Start != 4 || r.Length != 0 || r.RangeUnits != "UTF-16 code units" || r.Truncated {
+		t.Fatalf("server completion correlation/input/range changed: %+v; calls=%d", r, calls)
+	}
+	if len(r.Suggestions) != 1 || r.Suggestions[0].Text != "private-warp " || r.Suggestions[0].Tooltip == nil || *r.Suggestions[0].Tooltip != "Private warp" {
+		t.Fatalf("typed server suggestion or rendered tooltip changed: %+v", r.Suggestions)
+	}
+	out := newChatOutput()
+	out.interval, out.journal = 0, store.history()
+	var public, private []string
+	out.bind(func(_ context.Context, text string) error { public = append(public, text); return nil }, "GraceLocal")
+	out.bindWhisper(func(_ context.Context, actor, text string) error {
+		if actor != "Alice" {
+			t.Errorf("private suggestion sent to %q", actor)
+		}
+		private = append(private, text)
+		return nil
+	})
+	if err := out.sendMessage(ctx, r.Suggestions[0].Text); err != nil {
+		t.Fatal(err)
+	}
+	next, _ := scopedTurn(context.Background(), "Alice")
+	if err := out.sendMessage(next, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if len(private) != 1 || private[0] != "private-warp " || len(public) != 1 || public[0] != "hello" {
+		t.Fatalf("completion escaped private turn or tainted next turn: private=%q public=%q", private, public)
+	}
+	history, err := store.history().search(context.Background(), "Bob", json.RawMessage(`{"query":"private-warp"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(history)
+	if err != nil || strings.Contains(string(data), "private-warp") {
+		t.Fatalf("completion leaked through another player's journal: %s, %v", data, err)
+	}
+	expected = "/pw 🌍a"
+	value, err = completion.run(context.Background(), consoleActor, json.RawMessage(`{"input":"/pw 🌍a"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r = value.(commandCompletionResult)
+	if r.Input != expected || r.Start != 4 || r.Length != 3 {
+		t.Fatalf("UTF-16 range converted to byte/rune offsets: %+v", r)
+	}
+}
+
+func TestServerCompletionBoundsNeverShortenSuggestions(t *testing.T) {
+	s := newServerCommands(commandStore(t))
+	s.bind(func(context.Context, string) error { t.Fatal("completion executed a command"); return nil })
+	defer s.close()
+	for _, tc := range []struct {
+		name    string
+		matches []packets.CommandSuggestion
+		want    int
+		first   string
+	}{
+		{"count", make([]packets.CommandSuggestion, commandSuggestionLimit+1), commandSuggestionLimit, ""},
+		{"oversized text", []packets.CommandSuggestion{{Text: ns.String(strings.Repeat("x", commandTextLimit+1))}, {Text: "intact "}}, 1, "intact "},
+		{"oversized tooltip", []packets.CommandSuggestion{{Text: "omit", Tooltip: ns.PrefixedOptional[ns.TextComponent]{Present: true, Value: ns.TextComponent{Text: strings.Repeat("x", commandTextLimit+1)}}}, {Text: "intact "}}, 1, "intact "},
+		{"aggregate bytes", func() []packets.CommandSuggestion {
+			matches := make([]packets.CommandSuggestion, commandSuggestionBytes/commandTextLimit+1)
+			for i := range matches {
+				matches[i].Text = ns.String(strings.Repeat("x", commandTextLimit))
+			}
+			return matches
+		}(), commandSuggestionBytes / commandTextLimit, strings.Repeat("x", commandTextLimit)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s.bindCompletion(func(context.Context, string) (packets.S2CCommandSuggestions, error) {
+				return packets.S2CCommandSuggestions{Start: 4, Matches: tc.matches}, nil
+			})
+			value, err := s.complete(context.Background(), consoleActor, "/pw ")
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := value.(commandCompletionResult)
+			if !r.Truncated || len(r.Suggestions) != tc.want || r.Suggestions[0].Text != tc.first {
+				t.Fatalf("completion bounds changed entries or lost truncation: %+v", r)
+			}
+		})
+	}
+}
+
+func TestServerCompletionCancellationAndRebind(t *testing.T) {
+	for _, rebind := range []bool{false, true} {
+		t.Run(map[bool]string{false: "caller cancellation", true: "connection replacement"}[rebind], func(t *testing.T) {
+			s := newServerCommands(commandStore(t))
+			s.bind(func(context.Context, string) error { return nil })
+			defer s.close()
+			started := make(chan context.Context, 1)
+			s.bindCompletion(func(ctx context.Context, _ string) (packets.S2CCommandSuggestions, error) {
+				started <- ctx
+				<-ctx.Done()
+				return packets.S2CCommandSuggestions{}, ctx.Err()
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { _, err := s.complete(ctx, consoleActor, "/pw "); done <- err }()
+			submissionCtx := <-started
+			replacementCalls := 0
+			if rebind {
+				s.bind(func(context.Context, string) error { return nil })
+				if submissionCtx.Err() != context.Canceled {
+					t.Fatal("replacement did not synchronously invalidate old submission context")
+				}
+				s.bindCompletion(func(context.Context, string) (packets.S2CCommandSuggestions, error) {
+					replacementCalls++
+					return packets.S2CCommandSuggestions{}, nil
+				})
+			} else {
+				cancel()
+			}
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("completion cancellation: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("completion cancellation did not clean up callback")
+			}
+			if replacementCalls != 0 {
+				t.Fatal("old request submitted on replacement connection")
+			}
+			if rebind {
+				if _, err := s.complete(context.Background(), consoleActor, "/pw "); err != nil || replacementCalls != 1 {
+					t.Fatalf("fresh request did not use replacement: %v, calls=%d", err, replacementCalls)
+				}
+				s.bind(nil)
+				if _, err := s.complete(context.Background(), consoleActor, "/pw "); err == nil || replacementCalls != 1 {
+					t.Fatal("disconnected completion reached old callback")
+				}
+			}
+		})
+	}
+}
+
+func TestCompletionCancelledWhileWaitingForChatTransport(t *testing.T) {
+	chat := &synchronizedChat{ctx: context.Background(), gate: make(chan struct{}, 1)}
+	chat.gate <- struct{}{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { _, err := chat.completeCommand(ctx, "/pw ", nil); done <- err }()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled queued completion: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("completion remained stuck behind packet handling")
 	}
 }
