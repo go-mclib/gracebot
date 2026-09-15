@@ -51,6 +51,7 @@ func decodeArgs(raw json.RawMessage, target any) error {
 type toolRegistry struct {
 	definitions []openai.Tool
 	byName      map[string]toolSpec
+	blocked     func(string) bool
 }
 
 func newToolRegistry(groups ...[]toolSpec) *toolRegistry {
@@ -82,6 +83,8 @@ func (r *toolRegistry) execute(ctx context.Context, actor string, call openai.To
 		err = fmt.Errorf("unknown tool %q", call.Function.Name)
 	case strings.TrimSpace(actor) == "":
 		err = fmt.Errorf("a player identity is required")
+	case r.blocked != nil && r.blocked(actor):
+		err = fmt.Errorf("speaker is blocked")
 	default:
 		value, err = spec.run(ctx, actor, json.RawMessage(call.Function.Arguments))
 	}

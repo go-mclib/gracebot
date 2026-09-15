@@ -226,8 +226,8 @@ func TestDiscordHistoryRemainsPublicAndCannotOwnPrivateData(t *testing.T) {
 	store := testPlayerStore(t)
 	h := store.history()
 	now := time.Now()
-	actor := "@discord:realadmin"
-	if _, err := h.append("discord", actor, "public Discord fact", now); err != nil {
+	actor := discordBridgeActor
+	if _, err := h.appendDiscord("RealAdmin", "public Discord fact", now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.append("player", "RealAdmin", "public Minecraft fact", now); err != nil {
@@ -254,15 +254,15 @@ func TestDiscordHistoryRemainsPublicAndCannotOwnPrivateData(t *testing.T) {
 	if entries := historyEntries(t, h, actor, `{}`); len(entries) != 2 {
 		t.Fatalf("Discord actor lost public conversation history: %+v", entries)
 	}
-	if entries := historyEntries(t, h, "alice", `{"kind":"discord","player":"@discord:realadmin"}`); len(entries) != 1 || entries[0].Text != "public Discord fact" {
+	if entries := historyEntries(t, h, "alice", `{"kind":"discord","player":"#discord_bridge"}`); len(entries) != 1 || entries[0].Text != "public Discord fact" || entries[0].DisplayName != "RealAdmin" {
 		t.Fatalf("public Discord sender search failed: %+v", entries)
 	}
 	contextData := h.recentContext(0, actor)
 	if !json.Valid([]byte(contextData)) || strings.Contains(contextData, "secret") || !strings.Contains(contextData, "public Discord fact") || !strings.Contains(contextData, "public Minecraft fact") {
 		t.Fatalf("unsafe or missing Discord context: %s", contextData)
 	}
-	if _, err := storageActor(actor); err == nil {
-		t.Fatal("Discord identity became a storage account")
+	if got, err := storageActor(actor); err != nil || got != discordBridgeActor {
+		t.Fatal("shared Discord identity unavailable")
 	}
 	if store.hasRank(actor, "admin") {
 		t.Fatal("Discord nickname inherited Minecraft admin rank")
@@ -270,7 +270,16 @@ func TestDiscordHistoryRemainsPublicAndCannotOwnPrivateData(t *testing.T) {
 	if _, err := h.appendOwned("bot", "GraceLocal", actor, "private Discord write", now); err == nil {
 		t.Fatal("Discord identity became a private data owner")
 	}
-	if _, err := h.append("discord", "RealAdmin", "unnamespaced bridge input", now); err == nil {
-		t.Fatal("Discord archive accepted a Minecraft identity")
+	if _, err := h.append("discord", "RealAdmin", "unnamespaced bridge input", now); err != nil {
+		t.Fatal(err)
+	}
+	if entries := historyEntries(t, h, "alice", `{"query":"unnamespaced bridge input"}`); len(entries) != 1 || entries[0].Sender != discordBridgeActor || entries[0].DisplayName != "RealAdmin" {
+		t.Fatalf("Discord input aliased a Minecraft identity: %+v", entries)
+	}
+	if _, err := h.append("bot", "@discord:RealAdmin", "legacy sender input", now); err == nil {
+		t.Fatal("legacy Discord sender accepted for a non-Discord event")
+	}
+	if _, err := h.search(context.Background(), "@discord:RealAdmin", json.RawMessage(`{}`)); err == nil {
+		t.Fatal("legacy Discord caller retained a history identity")
 	}
 }

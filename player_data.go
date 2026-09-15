@@ -96,6 +96,10 @@ func openPlayerStore(databasePath, adminPath string) (*playerStore, error) {
 		db.Close()
 		return nil, err
 	}
+	if err = s.migrateModerationStorage(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -166,7 +170,7 @@ func storePlayerName(value string) (string, error) {
 	return value, nil
 }
 func storageActor(value string) (string, error) {
-	if value == consoleActor || value == "@server" {
+	if value == consoleActor || value == "@server" || value == discordBridgeActor {
 		return value, nil
 	}
 	return storePlayerName(value)
@@ -176,11 +180,31 @@ func (s *playerStore) hasRank(sender, rank string) bool {
 	if rank == "default" {
 		return true
 	}
-	if rank == "admin" {
-		return sender == consoleActor || s.admins[sender]
+	if sender == discordBridgeActor || strings.HasPrefix(sender, "@discord:") {
+		return false
+	}
+	if rank == "admin" && (sender == consoleActor || s.admins[sender]) {
+		return true
 	}
 	var found int
 	return s.db.QueryRow("SELECT 1 FROM ranks WHERE player=? AND rank=?", sender, rank).Scan(&found) == nil
+}
+
+// requireAdminTx checks authority in the same transaction as a durable mutation.
+func (s *playerStore) requireAdminTx(ctx context.Context, tx *sql.Tx, actor string) error {
+	actor = normalizeStoreName(actor)
+	if actor == consoleActor || s.admins[actor] {
+		return nil
+	}
+	if !validUsername(actor) {
+		return errors.New("administrator authority required")
+	}
+	var authorized int
+	err := tx.QueryRowContext(ctx, "SELECT 1 FROM ranks WHERE player=? AND rank='admin'", actor).Scan(&authorized)
+	if errors.Is(err, sql.ErrNoRows) {
+		return errors.New("administrator authority required")
+	}
+	return err
 }
 func (s *playerStore) addPoint(sender, game string) int {
 	sender, err := storePlayerName(sender)
@@ -190,7 +214,10 @@ func (s *playerStore) addPoint(sender, game string) int {
 		return 0
 	}
 	var points int
-	err = s.db.QueryRow("INSERT INTO scores(player,game,points) VALUES(?,?,1) ON CONFLICT(player,game) DO UPDATE SET points=points+1 RETURNING points", sender, game).Scan(&points)
+	err = s.db.QueryRow("INSERT INTO scores(player,game,points) SELECT ?,?,1 WHERE "+notBlockedSQL("?")+" ON CONFLICT(player,game) DO UPDATE SET points=points+1 RETURNING points", sender, game, sender, time.Now().UnixNano()).Scan(&points)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0
+	}
 	if err != nil {
 		log.Printf("persist game score: %v", err)
 		return 0
@@ -202,7 +229,7 @@ func (s *playerStore) playerRanks(ctx context.Context, name string) ([]string, e
 	if s.hasRank(name, "admin") {
 		result = append(result, "admin")
 	}
-	rows, err := s.db.QueryContext(ctx, "SELECT rank FROM ranks WHERE player=? ORDER BY rank", name)
+	rows, err := s.db.QueryContext(ctx, "SELECT rank FROM ranks WHERE player=? AND rank NOT IN ('admin','default') ORDER BY rank", name)
 	if err != nil {
 		return nil, err
 	}
@@ -233,15 +260,26 @@ func (s *playerStore) setRankTool(ctx context.Context, actor string, raw json.Ra
 		return nil, err
 	}
 	rank := normalizeStoreName(a.Rank)
-	if !validStoreIdentifier(rank, 64, false) || rank == "admin" || rank == "default" {
+	if !validStoreIdentifier(rank, 64, false) || rank == "default" {
 		return nil, errors.New("invalid or reserved rank")
+	}
+	if rank == "admin" && s.admins[name] {
+		return nil, errors.New("bootstrap administrators are managed in admins.json")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if err := s.requireAdminTx(ctx, tx, actor); err != nil {
+		return nil, err
 	}
 	var result sql.Result
 	switch a.Action {
 	case "add":
-		result, err = s.db.ExecContext(ctx, "INSERT OR IGNORE INTO ranks(player,rank) VALUES(?,?)", name, rank)
+		result, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO ranks(player,rank) VALUES(?,?)", name, rank)
 	case "remove":
-		result, err = s.db.ExecContext(ctx, "DELETE FROM ranks WHERE player=? AND rank=?", name, rank)
+		result, err = tx.ExecContext(ctx, "DELETE FROM ranks WHERE player=? AND rank=?", name, rank)
 	default:
 		return nil, errors.New("action must be add or remove")
 	}
@@ -255,6 +293,9 @@ func (s *playerStore) setRankTool(ctx context.Context, actor string, raw json.Ra
 	if n == 0 {
 		return nil, errors.New("rank already in requested state")
 	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
 	ranks, err := s.playerRanks(ctx, name)
 	return map[string]any{"player": name, "ranks": ranks, "action": a.Action, "rank": rank}, err
 }
@@ -267,7 +308,7 @@ func (s *playerStore) tools() []toolSpec {
 		makeTool("word_count", "Count a normalized word in retained public player chat; private messages never contribute.", map[string]any{"word": str, "player": str}, []string{"word"}, s.wordCountTool),
 		makeTool("top_words", "Most frequent normalized words in retained public player chat; private messages never contribute.", map[string]any{"player": str, "limit": limit}, nil, s.topWordsTool),
 		makeTool("server_stats", "Aggregate retained public events and observed presence, not lifetime server statistics.", map[string]any{}, nil, s.serverStatsTool),
-		makeTool("set_rank", "Administrator-only custom rank change; admin/default cannot be changed.", map[string]any{"player": str, "rank": str, "action": map[string]any{"type": "string", "enum": []string{"add", "remove"}}}, []string{"player", "rank", "action"}, s.setRankTool),
+		makeTool("set_rank", "Administrator-only rank change, including admin grants. The default rank and admins.json bootstrap administrators cannot be changed.", map[string]any{"player": str, "rank": str, "action": map[string]any{"type": "string", "enum": []string{"add", "remove"}}}, []string{"player", "rank", "action"}, s.setRankTool),
 	}
 	return append(tools, s.memoryTools()...)
 }

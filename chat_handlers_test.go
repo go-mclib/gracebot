@@ -47,18 +47,18 @@ func TestDiscordSystemChatEngagementAndCaptureIsolation(t *testing.T) {
 		{Text: "hey HELPER", Color: "white"},
 	}})
 	request, _, ready := a.engagements.take(time.Now().Add(3 * time.Second))
-	if !ready || request.sender != "@discord:some 用户 🌍" || len(request.messages) != 1 || request.messages[0].Text != "hey HELPER" || !request.mentioned {
-		t.Fatalf("styled Discord mention did not enqueue an isolated request: %+v", request)
+	if !ready || request.sender != discordBridgeActor || len(request.messages) != 1 || request.messages[0].Text != "hey HELPER" || request.messages[0].DisplayName != "Some 用户 🌍" || !request.mentioned {
+		t.Fatalf("styled Discord mention lost bridge identity/display label: %+v", request)
 	}
 	a.engagements.finish(request, "continue")
 	send(ns.NewTextComponent("[Discord] SOME   用户 🌍 » and what about tomorrow?"))
 	send(ns.NewTextComponent("[Discord] Other User » unrelated follow-up"))
 	request, _, ready = a.engagements.take(time.Now().Add(3 * time.Second))
-	if !ready || request.sender != "@discord:some 用户 🌍" || len(request.messages) != 1 || request.messages[0].Text != "and what about tomorrow?" || request.mentioned {
-		t.Fatalf("Discord continuation lost speaker identity: %+v", request)
+	if !ready || request.sender != discordBridgeActor || len(request.messages) != 2 || request.messages[0].Text != "and what about tomorrow?" || request.messages[1].DisplayName != "Other User" || request.mentioned {
+		t.Fatalf("Discord speakers did not share a labelled bridge conversation: %+v", request)
 	}
 	if _, _, ready := a.engagements.take(time.Now().Add(3 * time.Second)); ready {
-		t.Fatal("another Discord speaker inherited the active session")
+		t.Fatal("shared bridge batch was delivered twice")
 	}
 	if feedback := commands.active.result.Feedback; len(feedback) != 0 {
 		t.Fatalf("public bridge chat entered private command feedback: %+v", feedback)
@@ -140,27 +140,27 @@ func TestDiscordSystemChatWireComponents(t *testing.T) {
 			}
 			handler(c, &jp.WirePacket{PacketID: packet_ids.S2CSystemChatID, Data: append(data, 0)})
 			entries := historyEntries(t, r.journal, "alice", `{"kind":"discord"}`)
-			if len(entries) != 1 || entries[0].Sender != "@discord:eragon" || entries[0].Text != "Aaaaaa" || entries[0].Owner != "" {
-				t.Fatalf("reported bridge frame was not retained publicly with isolated identity: %+v", entries)
+			if len(entries) != 1 || entries[0].Sender != discordBridgeActor || entries[0].DisplayName != "Eragon" || entries[0].Text != "Aaaaaa" || entries[0].Owner != "" {
+				t.Fatalf("reported bridge frame lost shared attribution/display label: %+v", entries)
 			}
 			if _, _, ready := a.engagements.take(time.Now().Add(3 * time.Second)); ready {
 				t.Fatal("unmentioned reported bridge frame started an engagement")
 			}
-			// An ordinary mention starts the same speaker's conversation; the
-			// structured packet must then behave as that speaker's continuation.
+			// A mention starts the shared bridge conversation; subsequent
+			// structured packets continue it without nickname-specific identity.
 			mention, err := jp.ToWire(&packets.S2CSystemChat{Content: ns.NewTextComponent("[Discord] Eragon » grace hello")})
 			if err != nil {
 				t.Fatal(err)
 			}
 			handler(c, mention)
 			request, _, ready := a.engagements.take(time.Now().Add(3 * time.Second))
-			if !ready || request.sender != "@discord:eragon" || !request.mentioned {
-				t.Fatalf("bridge mention failed to start isolated engagement: %+v", request)
+			if !ready || request.sender != discordBridgeActor || !request.mentioned {
+				t.Fatalf("bridge mention failed to start shared engagement: %+v", request)
 			}
 			a.engagements.finish(request, "continue")
 			handler(c, &jp.WirePacket{PacketID: packet_ids.S2CSystemChatID, Data: append(data, 0)})
 			request, _, ready = a.engagements.take(time.Now().Add(3 * time.Second))
-			if !ready || request.sender != "@discord:eragon" || len(request.messages) != 1 || request.messages[0].Text != "Aaaaaa" || request.mentioned || store.hasRank(request.sender, "admin") {
+			if !ready || request.sender != discordBridgeActor || len(request.messages) != 1 || request.messages[0].Text != "Aaaaaa" || request.mentioned || store.hasRank(request.sender, "admin") {
 				t.Fatalf("structured bridge continuation lost identity or gained authority: %+v", request)
 			}
 			if feedback := commands.active.result.Feedback; len(feedback) != 0 {
@@ -218,7 +218,7 @@ func TestDiscordBridgeTrustBoundaryAndSelfEcho(t *testing.T) {
 	for _, nickname := range []string{"Grace", "RealAdmin", "@console", "@server"} {
 		send(&packets.S2CSystemChat{Content: ns.NewTextComponent("[Discord] " + nickname + " » grace hello")})
 		request, _, ready := a.engagements.take(time.Now().Add(3 * time.Second))
-		if !ready || request.sender != discordActorPrefix+strings.ToLower(nickname) || store.hasRank(request.sender, "admin") {
+		if !ready || request.sender != discordBridgeActor || request.messages[0].DisplayName != nickname || store.hasRank(request.sender, "admin") {
 			t.Fatalf("nickname suppressed or granted Minecraft authority: %+v", request)
 		}
 		a.engagements.finish(request, "disengage")
@@ -319,7 +319,7 @@ func TestDiscordPublicReplyUsesMinecraftChat(t *testing.T) {
 		t.Fatal("Discord public reply tried to whisper to a Minecraft account")
 		return nil
 	})
-	ctx, _ := scopedTurn(context.Background(), "@discord:some user")
+	ctx, _ := scopedTurn(context.Background(), discordBridgeActor)
 	if err := output.send(ctx, "Hello from Minecraft"); err != nil {
 		t.Fatal(err)
 	}

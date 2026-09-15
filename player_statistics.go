@@ -41,9 +41,26 @@ func (s *playerStore) recordPresenceLocked(names []string, at time.Time) error {
 		return err
 	}
 	defer tx.Rollback()
+	for name := range present {
+		blocked, err := actorsBlocked(context.Background(), tx, at, name)
+		if err != nil {
+			return err
+		}
+		if blocked {
+			delete(present, name)
+			delete(previous, name)
+		}
+	}
 	next := make(map[string]int64, len(present))
 	for name, id := range previous {
 		if id == 0 {
+			continue
+		}
+		blocked, err := actorsBlocked(context.Background(), tx, at, name)
+		if err != nil {
+			return err
+		}
+		if blocked {
 			continue
 		}
 		if _, err = tx.Exec("UPDATE presence SET end=max(end,?) WHERE id=?", at.UnixNano(), id); err != nil {
@@ -118,7 +135,7 @@ func (s *playerStore) retainedStats(ctx context.Context, actor string) (map[stri
 		}
 		return p
 	}
-	rows, err := tx.QueryContext(ctx, "SELECT sender,kind,count(*),min(at),max(at) FROM events WHERE at>=? AND owner='' AND kind IN ('player','death') GROUP BY sender,kind", cutoff)
+	rows, err := tx.QueryContext(ctx, "SELECT sender,kind,count(*),min(at),max(at) FROM events WHERE at>=? AND owner='' AND kind IN ('player','death') AND "+notBlockedSQL("events.sender")+" GROUP BY sender,kind", cutoff, now.UnixNano())
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +163,7 @@ func (s *playerStore) retainedStats(ctx context.Context, actor string) (map[stri
 	if err = errors.Join(rows.Err(), rows.Close()); err != nil {
 		return nil, err
 	}
-	rows, err = tx.QueryContext(ctx, "SELECT e.sender,sum(t.count),count(DISTINCT t.word) FROM tokens t JOIN events e ON e.id=t.event_id WHERE e.at>=? AND e.owner='' GROUP BY e.sender", cutoff)
+	rows, err = tx.QueryContext(ctx, "SELECT e.sender,sum(t.count),count(DISTINCT t.word) FROM tokens t JOIN events e ON e.id=t.event_id WHERE e.at>=? AND e.owner='' AND "+notBlockedSQL("e.sender")+" GROUP BY e.sender", cutoff, now.UnixNano())
 	if err != nil {
 		return nil, err
 	}
@@ -165,7 +182,7 @@ func (s *playerStore) retainedStats(ctx context.Context, actor string) (map[stri
 	if err = errors.Join(rows.Err(), rows.Close()); err != nil {
 		return nil, err
 	}
-	rows, err = tx.QueryContext(ctx, "SELECT sender,text,count(*) FROM events WHERE at>=? AND owner='' AND kind='death' GROUP BY sender,text", cutoff)
+	rows, err = tx.QueryContext(ctx, "SELECT sender,text,count(*) FROM events WHERE at>=? AND owner='' AND kind='death' AND "+notBlockedSQL("events.sender")+" GROUP BY sender,text", cutoff, now.UnixNano())
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +198,7 @@ func (s *playerStore) retainedStats(ctx context.Context, actor string) (map[stri
 	if err = errors.Join(rows.Err(), rows.Close()); err != nil {
 		return nil, err
 	}
-	rows, err = tx.QueryContext(ctx, "SELECT player,game,points FROM scores")
+	rows, err = tx.QueryContext(ctx, "SELECT player,game,points FROM scores WHERE "+notBlockedSQL("scores.player"), now.UnixNano())
 	if err != nil {
 		return nil, err
 	}
@@ -197,7 +214,7 @@ func (s *playerStore) retainedStats(ctx context.Context, actor string) (map[stri
 	if err = errors.Join(rows.Err(), rows.Close()); err != nil {
 		return nil, err
 	}
-	rows, err = tx.QueryContext(ctx, "SELECT id,player,start,end FROM presence WHERE end>=?", cutoff)
+	rows, err = tx.QueryContext(ctx, "SELECT id,player,start,end FROM presence WHERE end>=? AND "+notBlockedSQL("presence.player"), cutoff, now.UnixNano())
 	if err != nil {
 		return nil, err
 	}
@@ -225,6 +242,13 @@ func (s *playerStore) retainedStats(ctx context.Context, actor string) (map[stri
 		return nil, err
 	}
 	for name := range s.online {
+		blocked, err := actorsBlocked(ctx, tx, now, name)
+		if err != nil {
+			return nil, err
+		}
+		if blocked {
+			continue
+		}
 		get(name).Online = true
 	}
 	for name, n := range nanos {
@@ -246,6 +270,9 @@ func (s *playerStore) playerStatsTool(ctx context.Context, actor string, raw jso
 	name, err := storePlayerName(name)
 	if err != nil {
 		return nil, err
+	}
+	if s.actorBlocked(name, time.Now()) {
+		return nil, errors.New("player unavailable")
 	}
 	stats, err := s.retainedStats(ctx, actor)
 	if err != nil {
@@ -365,7 +392,7 @@ func (s *playerStore) wordCountTool(ctx context.Context, actor string, raw json.
 		}
 	}
 	var count int64
-	err = s.db.QueryRowContext(ctx, "SELECT coalesce(sum(t.count),0) FROM tokens t JOIN events e ON e.id=t.event_id WHERE e.at>=? AND e.owner='' AND t.word=? AND (?='' OR e.sender=?)", historyCutoff(time.Now()).UnixNano(), word, a.Player, a.Player).Scan(&count)
+	err = s.db.QueryRowContext(ctx, "SELECT coalesce(sum(t.count),0) FROM tokens t JOIN events e ON e.id=t.event_id WHERE e.at>=? AND e.owner='' AND t.word=? AND (?='' OR e.sender=?) AND "+notBlockedSQL("e.sender"), historyCutoff(time.Now()).UnixNano(), word, a.Player, a.Player, time.Now().UnixNano()).Scan(&count)
 	return map[string]any{"word": word, "player": a.Player, "global": a.Player == "", "count": count, "coverage": statisticsCoverage}, err
 }
 func (s *playerStore) topWordsTool(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
@@ -392,7 +419,7 @@ func (s *playerStore) topWordsTool(ctx context.Context, actor string, raw json.R
 			return nil, err
 		}
 	}
-	rows, err := s.db.QueryContext(ctx, "SELECT t.word,sum(t.count) n FROM tokens t JOIN events e ON e.id=t.event_id WHERE e.at>=? AND e.owner='' AND (?='' OR e.sender=?) GROUP BY t.word ORDER BY n DESC,t.word LIMIT ?", historyCutoff(time.Now()).UnixNano(), a.Player, a.Player, a.Limit)
+	rows, err := s.db.QueryContext(ctx, "SELECT t.word,sum(t.count) n FROM tokens t JOIN events e ON e.id=t.event_id WHERE e.at>=? AND e.owner='' AND (?='' OR e.sender=?) AND "+notBlockedSQL("e.sender")+" GROUP BY t.word ORDER BY n DESC,t.word LIMIT ?", historyCutoff(time.Now()).UnixNano(), a.Player, a.Player, time.Now().UnixNano(), a.Limit)
 	if err != nil {
 		return nil, err
 	}

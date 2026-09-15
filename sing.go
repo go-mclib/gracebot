@@ -55,9 +55,6 @@ func (a *activities) sing(ctx context.Context, actor string, raw json.RawMessage
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, err
 	}
-	if !a.store.hasRank(actor, "admin") && !a.store.hasRank(actor, "trusted") {
-		return nil, fmt.Errorf("only an admin or trusted player may start singing")
-	}
 	query := strings.TrimSpace(args.Query)
 	if query == "" || len(query) > 500 {
 		return nil, fmt.Errorf("provide a song title and optional artist of at most 500 bytes")

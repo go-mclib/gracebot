@@ -2,13 +2,60 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
 	"reflect"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestUnrankedSingingPreservesOwnershipAndAdminStop(t *testing.T) {
+	lyrics := make(chan string, 2)
+	a := newActivities(commandStore(t), func(ctx context.Context, text string) error {
+		select {
+		case lyrics <- text:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	defer a.close()
+	a.client.Transport = webTestTransport(func(r *http.Request) (*http.Response, error) {
+		return webTestResponse(r, http.StatusOK, "application/json", `[{"trackName":"Song","artistName":"Artist","syncedLyrics":"[00:00]first lyric\n[01:00]later lyric","duration":120}]`), nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	args := json.RawMessage(`{"query":"Song"}`)
+	for _, stopper := range []string{"Alice", consoleActor} {
+		if _, err := a.sing(ctx, "Alice", args); err != nil {
+			t.Fatalf("unranked singing rejected: %v", err)
+		}
+		select {
+		case text := <-lyrics:
+			if text != "first lyric" {
+				t.Fatalf("unexpected sung lyric: %q", text)
+			}
+		case <-ctx.Done():
+			t.Fatal("accepted song did not begin playback")
+		}
+		if _, err := a.sing(ctx, "Bob", args); err == nil {
+			t.Fatal("another actor replaced the active song")
+		}
+		if _, err := a.stopSinging(ctx, "Bob", json.RawMessage(`{}`)); err == nil {
+			t.Fatal("another actor stopped the active song")
+		}
+		value, err := a.stopSinging(ctx, stopper, json.RawMessage(`{}`))
+		if err != nil {
+			t.Fatalf("%s could not stop song: %v", stopper, err)
+		}
+		if state := value.(songState); state.State != "stopped" || state.Owner != "Alice" {
+			t.Fatalf("stop did not retain song ownership: %+v", state)
+		}
+	}
+}
 
 func TestVoiceSongFollowsAudioAndFallsBackWithoutRepeatingLyrics(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

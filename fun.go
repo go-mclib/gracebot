@@ -69,7 +69,7 @@ func (a *activities) tools() []toolSpec {
 		makeTool("urban", "Look up slang in Urban Dictionary. Results may contain adult language.", map[string]any{
 			"phrase": map[string]any{"type": "string"},
 		}, []string{"phrase"}, a.urban),
-		makeTool("sing", "Find lyrics and start a song asynchronously. Plays music over Simple Voice Chat with timed chat lyrics when available, otherwise lyrics in chat only. Requires admin or trusted rank. Returns track and loading/playback state; singing_status reports voice availability.", map[string]any{
+		makeTool("sing", "Find lyrics and start a song asynchronously. Plays music over Simple Voice Chat with timed chat lyrics when available, otherwise lyrics in chat only. Returns track and loading/playback state; singing_status reports voice availability.", map[string]any{
 			"query": map[string]any{"type": "string", "description": "Song title and optionally artist; not a URL."},
 		}, []string{"query"}, a.sing),
 		makeTool("stop_singing", "Stop the current song or lyrics search. Only its owner or an admin may stop it.", nil, nil, a.stopSinging),

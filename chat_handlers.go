@@ -49,7 +49,7 @@ func mentioned(message, username string, aliases []string) bool {
 
 var discordChatPattern = regexp.MustCompile(`^\[Discord\][\p{Zs}]+([^»\r\n]+?)[\p{Zs}]+»[\p{Zs}]+((?s:.+))$`)
 
-const discordActorPrefix = "@discord:"
+const discordBridgeActor = "#discord_bridge"
 
 func normalizeDiscordNickname(nickname string) string {
 	if !utf8.ValidString(nickname) {
@@ -61,20 +61,22 @@ func normalizeDiscordNickname(nickname string) string {
 		}
 	}
 	nickname = strings.ToLower(strings.Join(strings.Fields(nickname), " "))
-	if nickname == "" || len(discordActorPrefix)+len(nickname) > 128 {
+	if nickname == "" || len(nickname) > 119 {
 		return ""
 	}
 	return nickname
 }
 
 func isDiscordActor(actor string) bool {
-	nickname, ok := strings.CutPrefix(actor, discordActorPrefix)
-	return ok && nickname != "" && normalizeDiscordNickname(nickname) == nickname
+	return actor == discordBridgeActor
 }
 
 // Only system-chat packets may enter this bridge path. A nickname is an
 // unprivileged conversation label, never a Minecraft account or private owner.
 func (r *chatRouter) discordChat(ctx context.Context, username, text string, at time.Time) bool {
+	if strings.HasPrefix(text, "[Discord]") && r.moderation.blocked(discordBridgeActor, at) {
+		return true
+	}
 	match := discordChatPattern.FindStringSubmatch(text)
 	if match == nil {
 		return false
@@ -86,12 +88,20 @@ func (r *chatRouter) discordChat(ctx context.Context, username, text string, at 
 	if ctx.Err() != nil || nickname == normalizeDiscordNickname(username) {
 		return true
 	}
-	actor := discordActorPrefix + nickname
-	id, err := r.journal.append("discord", actor, match[2], at)
+	display := strings.TrimSpace(match[1])
+	if !r.admitChat(ctx, discordBridgeActor, display, match[2], false, at) {
+		return true
+	}
+	id, err := r.journal.appendDiscord(display, match[2], at)
 	if err != nil {
 		log.Printf("record Discord chat: %v", err)
+		return true
 	}
-	r.enqueue(ctx, username, actor, match[2], id, at, mentioned(match[2], username, r.aliases))
+	if id != 0 {
+		r.assistant.engagements.enqueue(chatRequest{sender: discordBridgeActor, username: username, ctx: ctx,
+			mentioned: mentioned(match[2], username, r.aliases),
+			messages:  []chatFragment{{ID: id, At: at, Text: match[2], DisplayName: display}}})
+	}
 	return true
 }
 
@@ -104,6 +114,7 @@ type chatRouter struct {
 	commands     *serverCommands
 	actions      *actionManager
 	consoleChat  bool
+	moderation   *chatModeration
 }
 
 func (r *chatRouter) playerChat(ctx context.Context, username, sender, message string) {
@@ -111,14 +122,35 @@ func (r *chatRouter) playerChat(ctx context.Context, username, sender, message s
 		return
 	}
 	at := time.Now()
+	if !r.admitChat(ctx, sender, "", message, false, at) {
+		return
+	}
 	eventID, err := r.journal.append("player", sender, message, at)
 	if err != nil {
 		log.Printf("record player chat: %v", err)
+		return
 	}
-	r.enqueue(ctx, username, sender, message, eventID, at, mentioned(message, username, r.aliases))
+	if eventID != 0 {
+		r.enqueue(ctx, username, sender, message, eventID, at, mentioned(message, username, r.aliases))
+	}
+}
+
+func (r *chatRouter) admitChat(ctx context.Context, sender, display, text string, private bool, at time.Time) bool {
+	if !r.moderation.admit(ctx, sender, text, at) {
+		return false
+	}
+	r.moderation.noteSpeaker(sender, display, at)
+	if r.moderation.command(ctx, sender, text, private, at) {
+		r.assistant.engagements.forget(sender)
+		return false
+	}
+	return true
 }
 
 func (r *chatRouter) enqueue(ctx context.Context, username, sender, text string, id uint64, at time.Time, mention bool) {
+	if r.moderation.blocked(sender, at) {
+		return
+	}
 	r.assistant.engagements.enqueue(chatRequest{sender: sender, username: username, ctx: ctx, mentioned: mention,
 		messages: []chatFragment{{ID: id, At: at, Text: text}}})
 }
@@ -157,6 +189,7 @@ func (r *chatRouter) handler(ctx context.Context, players *playerlist.Module) cl
 			for _, player := range profiles {
 				if player.Name != "" {
 					names = append(names, player.Name)
+					r.moderation.noteSpeaker(player.Name, "", time.Now())
 				}
 			}
 			if err := r.store.recordPresence(names, time.Now()); err != nil {
@@ -177,21 +210,23 @@ func (r *chatRouter) handler(ctx context.Context, players *playerlist.Module) cl
 			isPrivate := privateChatType(typeName) || packet.ChatType.TargetName.Present
 			player := players.GetPlayer([16]byte(packet.Sender))
 			if player == nil {
-				kind := "disguised"
-				if isPrivate || !publicChatType(typeName) {
-					kind = "private_disguised"
-				}
-				r.rememberContext(kind, "", string(packet.Body.Content))
-				log.Printf("retained chat from unresolved player UUID %s without granting authority", packet.Sender)
+				// Unresolved input cannot be safely attributed or checked against
+				// a block. Do not retain it as anonymous model context.
 				return
 			}
 			if isPrivate {
+				if !r.admitChat(ctx, player.Name, "", string(packet.Body.Content), true, time.Now()) {
+					return
+				}
 				r.rememberContext("private", player.Name, string(packet.Body.Content))
 				return
 			}
 			// Paper uses paper:raw for renderer-decorated player chat.
 			// Accept it only with a resolved player UUID, never as server feedback.
 			if !publicChatType(typeName) && typeName != "paper:raw" {
+				if !r.admitChat(ctx, player.Name, "", string(packet.Body.Content), true, time.Now()) {
+					return
+				}
 				r.rememberInternal("player", player.Name, string(packet.Body.Content))
 				return
 			}
@@ -211,11 +246,17 @@ func (r *chatRouter) handler(ctx context.Context, players *playerlist.Module) cl
 				return
 			}
 			if strings.HasPrefix(packet.Content.Translate, "death.") && len(packet.Content.With) > 0 {
+				if r.moderation.blocked(packet.Content.With[0].String(), at) {
+					return
+				}
 				r.rememberContext("system", "", text)
 				if err := r.store.recordDeath(packet.Content.With[0].String(), packet.Content.Translate); err != nil {
 					log.Printf("record death: %v", err)
 				}
 			} else if packet.Content.Translate == "multiplayer.player.joined" || packet.Content.Translate == "multiplayer.player.left" {
+				if len(packet.Content.With) > 0 && r.moderation.blocked(packet.Content.With[0].String(), at) {
+					return
+				}
 				r.rememberContext("system", "", text)
 			} else {
 				if r.captureFeedback(text, at) {
@@ -233,6 +274,9 @@ func (r *chatRouter) handler(ctx context.Context, players *playerlist.Module) cl
 			}
 			typeName := chatTypeName(c, packet.ChatType)
 			sender, text, at := packet.ChatType.Name.String(), packet.Message.String(), time.Now()
+			if r.moderation.blocked(sender, at) {
+				return
+			}
 			if privateChatType(typeName) || packet.ChatType.TargetName.Present {
 				r.rememberInternal("private_disguised", sender, text)
 				return

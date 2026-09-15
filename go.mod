@@ -3,7 +3,7 @@ module github.com/go-mclib/gracebot
 go 1.26.0
 
 require (
-	github.com/go-mclib/client v0.0.0-20260915052706-8eeeb80755c5
+	github.com/go-mclib/client v0.0.0-20260915061840-a8c42c0f0e3d
 	github.com/go-mclib/data v0.0.0-20260915044945-8957c18fe1a8
 	github.com/go-mclib/nbt v0.0.0
 	github.com/go-mclib/protocol v0.0.0-20260915052648-6c01ecdcc533

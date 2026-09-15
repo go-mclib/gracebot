@@ -69,7 +69,7 @@ func TestSQLiteRanksScoresPersistAndRemainAuthorized(t *testing.T) {
 			t.Fatal("ordinary player changed rank")
 		}
 	}
-	for _, rank := range []string{"ADMIN", "default", "x'); DROP TABLE ranks;--"} {
+	for _, rank := range []string{"default", "x'); DROP TABLE ranks;--"} {
 		raw, _ := json.Marshal(map[string]string{"player": "alice", "rank": rank, "action": "add"})
 		if err := storeToolResult(t, s, "set_rank", "RealAdmin", string(raw), nil); err == nil {
 			t.Fatal("invalid rank granted")

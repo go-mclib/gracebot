@@ -165,6 +165,20 @@ func (e *conversationEngagement) finish(request chatRequest, decision string) {
 	}
 }
 
+// forget immediately cancels work and drops queued input for a blocked actor.
+func (e *conversationEngagement) forget(actor string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	key := normalizeStoreName(actor)
+	if state := e.players[key]; state != nil {
+		if state.cancel != nil {
+			state.cancel()
+		}
+		delete(e.players, key)
+	}
+	e.signal()
+}
+
 func (e *conversationEngagement) reset() {
 	e.mu.Lock()
 	defer e.mu.Unlock()

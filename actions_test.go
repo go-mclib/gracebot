@@ -3,12 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-mclib/client"
+	"github.com/go-mclib/client/modules/collisions"
 	"github.com/go-mclib/client/modules/combat"
 	"github.com/go-mclib/client/modules/entities"
 	"github.com/go-mclib/client/modules/pathfinding"
@@ -25,6 +25,76 @@ import (
 func inertActionSession() *actionSession {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &actionSession{ctx: ctx, cancel: cancel, me: self.New(), physics: physics.New(), path: pathfinding.New(), combat: combat.New(), world: world.New(), entities: entities.New()}
+}
+
+func activeActionSession(t *testing.T) *actionSession {
+	t.Helper()
+	s := inertActionSession()
+	c := client.New("unused", "Grace", false)
+	c.SetState(jp.StatePlay)
+	s.client = c
+	col := collisions.New()
+	for _, module := range []client.Module{s.me, s.world, col, s.physics} {
+		c.Register(module)
+	}
+	if err := col.Wire(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.physics.Wire(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.cancel(); s.physics.Reset() })
+	s.me.HandlePacket(observationPacket(t, &packets.S2CLogin{EntityId: 1, DimensionName: "minecraft:overworld"}))
+	s.me.HandlePacket(observationPacket(t, &packets.S2CPlayerPosition{X: 1, Y: 64, Z: 1}))
+	s.positionKnown = true
+	return s
+}
+
+func TestActionGameplayOpenButConstructionRequiresAdmin(t *testing.T) {
+	store := commandStore(t)
+	if _, err := store.setRankTool(context.Background(), consoleActor, json.RawMessage(`{"player":"Bob","rank":"trusted","action":"add"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.setRankTool(context.Background(), consoleActor, json.RawMessage(`{"player":"Root","rank":"admin","action":"add"}`)); err != nil {
+		t.Fatal(err)
+	}
+	m := newActionManager(store)
+	m.session = activeActionSession(t)
+	defer m.stopCurrent("test finished")
+	for _, kind := range []string{"move", "follow", "fight", "mount", "dismount"} {
+		value, err := m.submit(context.Background(), "Alice", kind, &actionJob{})
+		if err != nil {
+			t.Fatalf("unranked %s rejected: %v", kind, err)
+		}
+		if status := value.(actionStatus); status.Owner != "Alice" || status.Kind != kind || status.State != "queued" {
+			t.Fatalf("action was not admitted: %+v", status)
+		}
+		m.stopCurrent("test next action")
+	}
+	build := m.buildTool()
+	args := json.RawMessage(`{"origin":[1,64,1],"size":[1,1,1],"block":"stone"}`)
+	for _, actor := range []string{"Alice", "Bob", discordBridgeActor} {
+		if _, err := build.run(context.Background(), actor, args); err == nil {
+			t.Fatalf("non-admin %s started construction", actor)
+		}
+		if m.current != nil {
+			t.Fatal("denied construction installed a job")
+		}
+	}
+	value, err := build.run(context.Background(), "Root", args)
+	if err != nil {
+		t.Fatalf("admin construction rejected: %v", err)
+	}
+	if value.(actionStatus).Kind != "build" {
+		t.Fatalf("admin construction did not start: %+v", value)
+	}
+	if _, err := store.setRankTool(context.Background(), consoleActor, json.RawMessage(`{"player":"Root","rank":"admin","action":"remove"}`)); err != nil {
+		t.Fatal(err)
+	}
+	m.tick(m.session.client)
+	if m.current != nil || m.history[len(m.history)-1].State != "cancelled" {
+		t.Fatal("construction survived admin revocation")
+	}
 }
 
 func TestActionStopIsCancellationAndMotionBarrier(t *testing.T) {
@@ -67,20 +137,8 @@ func TestActionStopIsCancellationAndMotionBarrier(t *testing.T) {
 	}
 }
 
-func TestActionOwnerCannotBeReplacedByAnotherTrustedPlayer(t *testing.T) {
-	dir := t.TempDir()
-	admins := filepath.Join(dir, "admins.json")
-	if err := os.WriteFile(admins, []byte(`["Root"]`), 0600); err != nil {
-		t.Fatal(err)
-	}
-	store, err := openPlayerStore(filepath.Join(dir, "state.sqlite"), admins)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.close()
-	if _, err = store.setRankTool(context.Background(), "Root", json.RawMessage(`{"player":"Bob","rank":"trusted","action":"add"}`)); err != nil {
-		t.Fatal(err)
-	}
+func TestActionOwnerCannotBeReplacedByAnotherPlayer(t *testing.T) {
+	store := commandStore(t)
 	s := inertActionSession()
 	defer s.cancel()
 	ctx, cancel := context.WithCancel(s.ctx)
@@ -89,8 +147,8 @@ func TestActionOwnerCannotBeReplacedByAnotherTrustedPlayer(t *testing.T) {
 	m := newActionManager(store)
 	m.session = s
 	m.current = current
-	if _, err = m.submit(context.Background(), "Bob", "move", &actionJob{}); err == nil || !strings.Contains(err.Error(), "belongs to Alice") {
-		t.Fatalf("another trusted actor replaced owner: %v", err)
+	if _, err := m.submit(context.Background(), "Bob", "move", &actionJob{}); err == nil || !strings.Contains(err.Error(), "belongs to Alice") {
+		t.Fatalf("another actor replaced owner: %v", err)
 	}
 	if ctx.Err() != nil || m.current != current {
 		t.Fatal("unauthorized replacement cancelled existing action")

@@ -23,7 +23,14 @@ func commandStore(t *testing.T) *playerStore {
 	return s
 }
 func TestServerCommandSafetyAndAuthority(t *testing.T) {
-	s := newServerCommands(commandStore(t))
+	store := commandStore(t)
+	if _, err := store.setRankTool(context.Background(), consoleActor, json.RawMessage(`{"player":"Bob","rank":"trusted","action":"add"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.setRankTool(context.Background(), consoleActor, json.RawMessage(`{"player":"Root","rank":"admin","action":"add"}`)); err != nil {
+		t.Fatal(err)
+	}
+	s := newServerCommands(store)
 	s.window = time.Millisecond
 	s.bind(func(context.Context, string) error { return nil })
 	defer s.close()
@@ -32,9 +39,11 @@ func TestServerCommandSafetyAndAuthority(t *testing.T) {
 			t.Errorf("unsafe command accepted: %q", command)
 		}
 	}
-	for _, command := range []string{"stop", "minecraft:help", "help @a", "list uuids", "plugins reload", "help a b", "version --reload"} {
-		if _, err := s.execute(context.Background(), "alice", command); err == nil {
-			t.Errorf("untrusted command accepted: %q", command)
+	for _, actor := range []string{"alice", "Bob"} {
+		for _, command := range []string{"stop", "minecraft:help", "help @a", "list uuids", "plugins reload", "help a b", "version --reload"} {
+			if _, err := s.execute(context.Background(), actor, command); err == nil {
+				t.Errorf("non-admin %s command accepted: %q", actor, command)
+			}
 		}
 	}
 	for _, command := range []string{"/help", "plugins", "help 2", "help teleport", "version Essentials", "list"} {
@@ -49,11 +58,63 @@ func TestServerCommandSafetyAndAuthority(t *testing.T) {
 	}
 	stopped := false
 	s.BeforeMutation = func() { stopped = true }
-	if _, err := s.execute(context.Background(), consoleActor, "time query daytime"); err != nil {
+	value, err := s.execute(context.Background(), "Root", "time query daytime")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !value.(commandResult).Submitted {
+		t.Fatalf("admin command was not submitted: %+v", value)
 	}
 	if !stopped {
 		t.Fatal("mutating command did not stop physical action")
+	}
+}
+
+func TestServerCommandRevokedAdminCannotSubmitAfterMutationBarrier(t *testing.T) {
+	store := commandStore(t)
+	for _, rank := range []string{"trusted", "admin"} {
+		raw := json.RawMessage(`{"player":"Alice","rank":"` + rank + `","action":"add"}`)
+		if _, err := store.setRankTool(context.Background(), consoleActor, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := newServerCommands(store)
+	s.bind(func(context.Context, string) error {
+		t.Error("revoked admin command reached Minecraft")
+		return nil
+	})
+	defer s.close()
+	revoked := make(chan error, 1)
+	s.BeforeMutation = func() {
+		_, err := store.setRankTool(context.Background(), consoleActor, json.RawMessage(`{"player":"Alice","rank":"admin","action":"remove"}`))
+		revoked <- err
+	}
+	value, err := s.execute(context.Background(), "Alice", "time query daytime")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-revoked; err != nil {
+		t.Fatal(err)
+	}
+	if value.(commandResult).Submitted {
+		t.Fatal("trusted rank retained revoked admin command authority")
+	}
+}
+
+func TestServerCompletionWithholdsReplyAfterAdminRevocation(t *testing.T) {
+	store := commandStore(t)
+	if _, err := store.setRankTool(context.Background(), consoleActor, json.RawMessage(`{"player":"Alice","rank":"admin","action":"add"}`)); err != nil {
+		t.Fatal(err)
+	}
+	s := newServerCommands(store)
+	s.bind(func(context.Context, string) error { return nil })
+	defer s.close()
+	s.bindCompletion(func(context.Context, string) (packets.S2CCommandSuggestions, error) {
+		_, err := store.setRankTool(context.Background(), consoleActor, json.RawMessage(`{"player":"Alice","rank":"admin","action":"remove"}`))
+		return packets.S2CCommandSuggestions{Matches: []packets.CommandSuggestion{{Text: "private-warp"}}}, err
+	})
+	if value, err := s.complete(context.Background(), "Alice", "/pw "); err == nil || value != nil {
+		t.Fatalf("revoked admin received private completion: %+v, %v", value, err)
 	}
 }
 func TestDiscordCommandsCannotCaptureButCanDiscover(t *testing.T) {
@@ -68,7 +129,7 @@ func TestDiscordCommandsCannotCaptureButCanDiscover(t *testing.T) {
 		return []string{"help", "time"}, nil
 	})
 	for _, command := range []string{"help", "time query daytime"} {
-		if _, err := s.execute(context.Background(), "@discord:alice", command); err == nil {
+		if _, err := s.execute(context.Background(), discordBridgeActor, command); err == nil {
 			t.Fatalf("Discord command was accepted: %q", command)
 		}
 		if s.observe("public system chat after rejected request", time.Now()) {
@@ -79,7 +140,7 @@ func TestDiscordCommandsCannotCaptureButCanDiscover(t *testing.T) {
 		if spec.name != "discover_server_commands" {
 			continue
 		}
-		value, err := spec.run(context.Background(), "@discord:alice", json.RawMessage(`{}`))
+		value, err := spec.run(context.Background(), discordBridgeActor, json.RawMessage(`{}`))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -230,6 +291,9 @@ func TestCommandCancelledWhileWaitingForChatTransport(t *testing.T) {
 
 func TestServerCompletionAuthorityExactInputAndPrivacy(t *testing.T) {
 	store := commandStore(t)
+	if _, err := store.setRankTool(context.Background(), consoleActor, json.RawMessage(`{"player":"Bob","rank":"trusted","action":"add"}`)); err != nil {
+		t.Fatal(err)
+	}
 	s := newServerCommands(store)
 	s.bind(func(context.Context, string) error {
 		t.Error("completion executed a command")
@@ -270,7 +334,7 @@ func TestServerCompletionAuthorityExactInputAndPrivacy(t *testing.T) {
 	if completion.run == nil {
 		t.Fatal("completion tool is not registered")
 	}
-	for _, actor := range []string{"Alice", "@discord:alice", "@discord:console", "@server", ""} {
+	for _, actor := range []string{"Alice", "Bob", discordBridgeActor, "@discord:alice", "@discord:console", "@server", ""} {
 		if _, err := completion.run(context.Background(), actor, json.RawMessage(`{"input":"/pw "}`)); err == nil {
 			t.Errorf("unauthorized actor accepted: %q", actor)
 		}
@@ -278,7 +342,7 @@ func TestServerCompletionAuthorityExactInputAndPrivacy(t *testing.T) {
 	if calls != 0 {
 		t.Fatal("unauthorized completion reached transport")
 	}
-	if _, err := store.setRankTool(context.Background(), consoleActor, json.RawMessage(`{"player":"Alice","rank":"trusted","action":"add"}`)); err != nil {
+	if _, err := store.setRankTool(context.Background(), consoleActor, json.RawMessage(`{"player":"Alice","rank":"admin","action":"add"}`)); err != nil {
 		t.Fatal(err)
 	}
 	ctx, _ := scopedTurn(context.Background(), "Alice")

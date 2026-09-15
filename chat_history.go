@@ -24,14 +24,15 @@ func historyCutoff(now time.Time) time.Time {
 }
 
 type chatEntry struct {
-	ID       uint64    `json:"id"`
-	At       time.Time `json:"at"`
-	Kind     string    `json:"kind"`
-	Sender   string    `json:"sender,omitempty"`
-	Owner    string    `json:"owner,omitempty"`
-	Text     string    `json:"text"`
-	Source   string    `json:"source,omitempty"`
-	SourceID *uint64   `json:"source_id,omitempty"`
+	ID          uint64    `json:"id"`
+	At          time.Time `json:"at"`
+	Kind        string    `json:"kind"`
+	Sender      string    `json:"sender,omitempty"`
+	DisplayName string    `json:"display_name,omitempty"`
+	Owner       string    `json:"owner,omitempty"`
+	Text        string    `json:"text"`
+	Source      string    `json:"source,omitempty"`
+	SourceID    *uint64   `json:"source_id,omitempty"`
 }
 type chatHistory struct{ store *playerStore }
 
@@ -53,8 +54,20 @@ func validateChatEntry(e *chatEntry) error {
 		return errors.New("invalid chat entry")
 	}
 	e.At = e.At.UTC()
-	if e.Kind == "discord" && (!isDiscordActor(e.Sender) || e.Owner != "") {
-		return errors.New("Discord chat requires a public namespaced sender")
+	if e.Kind == "discord" {
+		if e.DisplayName == "" && e.Sender != discordBridgeActor {
+			e.DisplayName = e.Sender
+		}
+		e.Sender = discordBridgeActor
+	}
+	if strings.HasPrefix(normalizeStoreName(e.Sender), "@discord:") {
+		return errors.New("legacy Discord sender is not a live actor")
+	}
+	if len(e.DisplayName) > 128 || !utf8.ValidString(e.DisplayName) || e.Kind != "discord" && e.DisplayName != "" {
+		return errors.New("invalid display name")
+	}
+	if e.Kind == "discord" && e.Owner != "" {
+		return errors.New("Discord chat requires public ownership")
 	}
 	if e.Kind == "player" || e.Kind == "private" || e.Kind == "death" {
 		name, err := storePlayerName(e.Sender)
@@ -62,6 +75,9 @@ func validateChatEntry(e *chatEntry) error {
 			return err
 		}
 		e.Sender = name
+	}
+	if e.Owner == discordBridgeActor {
+		return errors.New("Discord identity cannot own private events")
 	}
 	if e.Owner != "" && e.Owner != "@unattributed" {
 		owner, err := storageActor(e.Owner)
@@ -78,6 +94,9 @@ func validateChatEntry(e *chatEntry) error {
 	}
 	return nil
 }
+func (h *chatHistory) appendDiscord(nickname, text string, at time.Time) (uint64, error) {
+	return h.appendEntry(chatEntry{Kind: "discord", Sender: discordBridgeActor, DisplayName: nickname, Text: text, At: at, Source: "live"})
+}
 func (h *chatHistory) append(kind, sender, text string, at time.Time) (uint64, error) {
 	owner := ""
 	if kind == "private" {
@@ -86,7 +105,9 @@ func (h *chatHistory) append(kind, sender, text string, at time.Time) (uint64, e
 	return h.appendOwned(kind, sender, owner, text, at)
 }
 func (h *chatHistory) appendOwned(kind, sender, owner, text string, at time.Time) (uint64, error) {
-	e := chatEntry{Kind: kind, Sender: sender, Owner: owner, Text: text, At: at, Source: "live"}
+	return h.appendEntry(chatEntry{Kind: kind, Sender: sender, Owner: owner, Text: text, At: at, Source: "live"})
+}
+func (h *chatHistory) appendEntry(e chatEntry) (uint64, error) {
 	if err := validateChatEntry(&e); err != nil {
 		return 0, err
 	}
@@ -102,7 +123,11 @@ func (h *chatHistory) appendOwned(kind, sender, owner, text string, at time.Time
 	return id, tx.Commit()
 }
 func insertChatEntry(ctx context.Context, tx *sql.Tx, e chatEntry) (uint64, error) {
-	result, err := tx.ExecContext(ctx, "INSERT INTO events(at,kind,sender,owner,text,source,source_id) VALUES(?,?,?,?,?,?,?)", e.At.UnixNano(), e.Kind, e.Sender, e.Owner, e.Text, e.Source, e.SourceID)
+	blocked, err := actorsBlocked(ctx, tx, time.Now(), e.Sender, e.Owner)
+	if err != nil || blocked {
+		return 0, err
+	}
+	result, err := tx.ExecContext(ctx, "INSERT INTO events(at,kind,sender,owner,text,source,source_id,display_name) VALUES(?,?,?,?,?,?,?,?)", e.At.UnixNano(), e.Kind, e.Sender, e.Owner, e.Text, e.Source, e.SourceID, e.DisplayName)
 	if err != nil {
 		return 0, err
 	}
@@ -139,7 +164,7 @@ func scanChatEntry(rows interface{ Scan(...any) error }) (chatEntry, error) {
 	var e chatEntry
 	var at int64
 	var sourceID sql.NullInt64
-	err := rows.Scan(&e.ID, &at, &e.Kind, &e.Sender, &e.Owner, &e.Text, &e.Source, &sourceID)
+	err := rows.Scan(&e.ID, &at, &e.Kind, &e.Sender, &e.Owner, &e.Text, &e.Source, &sourceID, &e.DisplayName)
 	e.At = time.Unix(0, at).UTC()
 	if sourceID.Valid {
 		id := uint64(sourceID.Int64)
@@ -148,7 +173,7 @@ func scanChatEntry(rows interface{ Scan(...any) error }) (chatEntry, error) {
 	return e, err
 }
 
-const eventColumns = "id,at,kind,sender,owner,text,source,source_id"
+const eventColumns = "id,at,kind,sender,owner,text,source,source_id,display_name"
 
 func (h *chatHistory) recentContext(before uint64, actor string) string {
 	if h == nil {
@@ -212,6 +237,8 @@ func (h *chatHistory) search(ctx context.Context, actor string, raw json.RawMess
 		query = "SELECT " + eventColumns + " FROM events WHERE at>=? AND owner=''"
 		params = []any{cutoff.UnixNano()}
 	}
+	query += " AND " + notBlockedSQL("events.sender", "events.owner")
+	params = append(params, time.Now().UnixNano())
 	if a.Player != "" {
 		name := a.Player
 		if !isDiscordActor(name) {

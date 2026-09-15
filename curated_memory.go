@@ -62,19 +62,33 @@ func (s *playerStore) writeMemory(ctx context.Context, actor string, raw json.Ra
 		return nil, err
 	}
 	a.Subject = strings.TrimSpace(a.Subject)
+	if strings.HasPrefix(normalizeStoreName(a.Subject), "@discord:") {
+		return nil, errors.New("legacy Discord subject is not a live actor")
+	}
 	a.Fact = strings.TrimSpace(a.Fact)
 	if a.Subject == "" || len(a.Subject) > 128 || a.Fact == "" || len(a.Fact) > 1000 || !utf8.ValidString(a.Subject) || !utf8.ValidString(a.Fact) || len(a.SourceIDs) > 8 || a.Visibility != "private" && a.Visibility != "public" || update && a.ID <= 0 || !update && a.ID != 0 {
 		return nil, errors.New("invalid memory fields or bounds")
+	}
+	if isDiscordActor(actor) && a.Visibility == "private" {
+		return nil, errors.New("Discord identity cannot own private memories")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
+	now := time.Now().UTC().UnixNano()
+	blocked, err := actorsBlocked(ctx, tx, time.Unix(0, now), actor, a.Subject)
+	if err != nil {
+		return nil, err
+	}
+	if blocked {
+		return nil, errors.New("memory actor or subject unavailable")
+	}
 	var existingPrivate int
 	if update {
 		var owner string
-		if err = tx.QueryRowContext(ctx, "SELECT owner FROM memories WHERE id=?", a.ID).Scan(&owner); err != nil {
+		if err = tx.QueryRowContext(ctx, "SELECT owner FROM memories WHERE id=? AND "+memoryNotBlockedSQL, a.ID, now, now).Scan(&owner); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil, errors.New("memory unavailable or not owned by you")
 			}
@@ -103,7 +117,7 @@ func (s *playerStore) writeMemory(ctx context.Context, actor string, raw json.Ra
 		}
 		seen[id] = true
 		src := source{id: id}
-		err = tx.QueryRowContext(ctx, "SELECT owner,sender,at FROM events WHERE id=? AND at>=? AND (owner='' OR owner=?)", id, historyCutoff(time.Now()).UnixNano(), actor).Scan(&src.owner, &src.sender, &src.at)
+		err = tx.QueryRowContext(ctx, "SELECT owner,sender,at FROM events WHERE id=? AND at>=? AND (owner='' OR owner=?) AND "+notBlockedSQL("events.sender", "events.owner"), id, historyCutoff(time.Unix(0, now)).UnixNano(), actor, now).Scan(&src.owner, &src.sender, &src.at)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, errors.New("source event unavailable or not visible")
 		}
@@ -118,7 +132,6 @@ func (s *playerStore) writeMemory(ctx context.Context, actor string, raw json.Ra
 	if a.Visibility == "public" && existingPrivate > 0 {
 		return nil, errors.New("private-source facts cannot be promoted to public")
 	}
-	now := time.Now().UTC().UnixNano()
 	if update {
 		_, err = tx.ExecContext(ctx, "UPDATE memories SET subject=?,fact=?,visibility=?,updated_at=? WHERE id=?", a.Subject, a.Fact, a.Visibility, now, a.ID)
 	} else {
@@ -171,12 +184,21 @@ func (s *playerStore) searchMemoryTool(ctx context.Context, actor string, raw js
 	if a.After < 0 || a.Limit < 1 || a.Limit > 25 || len(a.Query) > 500 || len(a.Subject) > 128 {
 		return nil, errors.New("invalid memory search bounds")
 	}
+	if strings.HasPrefix(normalizeStoreName(a.Subject), "@discord:") {
+		return nil, errors.New("legacy Discord subject is not a live actor")
+	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, "SELECT id,subject,fact,owner,visibility,attribution,created_at,updated_at FROM memories WHERE id>? AND (visibility='public' OR owner=?) AND (?='' OR subject=? COLLATE NOCASE) AND instr(lower(fact),lower(?))>0 ORDER BY id LIMIT ?", a.After, actor, a.Subject, a.Subject, a.Query, a.Limit+1)
+	// Discord has one public identity, never a private data owner.
+	visibleOwner := actor
+	if isDiscordActor(actor) {
+		visibleOwner = ""
+	}
+	now := time.Now().UnixNano()
+	rows, err := tx.QueryContext(ctx, "SELECT id,subject,fact,owner,visibility,attribution,created_at,updated_at FROM memories WHERE id>? AND (visibility='public' OR owner=?) AND (?='' OR subject=? COLLATE NOCASE) AND instr(lower(fact),lower(?))>0 AND "+memoryNotBlockedSQL+" ORDER BY id LIMIT ?", a.After, visibleOwner, a.Subject, a.Subject, a.Query, now, now, a.Limit+1)
 	if err != nil {
 		return nil, err
 	}
@@ -236,6 +258,9 @@ func (s *playerStore) forgetMemoryTool(ctx context.Context, actor string, raw js
 	actor, err := storageActor(actor)
 	if err != nil {
 		return nil, err
+	}
+	if s.actorBlocked(actor, time.Now()) {
+		return nil, errors.New("memory actor unavailable")
 	}
 	if a.ID <= 0 {
 		return nil, errors.New("positive memory ID required")

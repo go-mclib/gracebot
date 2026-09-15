@@ -114,9 +114,6 @@ type actionManager struct {
 }
 
 func newActionManager(store *playerStore) *actionManager { return &actionManager{store: store} }
-func (m *actionManager) trusted(actor string) bool {
-	return m.store != nil && (m.store.hasRank(actor, "trusted") || m.store.hasRank(actor, "admin"))
-}
 func (m *actionManager) admin(actor string) bool {
 	return m.store != nil && m.store.hasRank(actor, "admin")
 }
@@ -320,9 +317,8 @@ func (m *actionManager) submit(ctx context.Context, actor, kind string, j *actio
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	// Movement can open doors, so all new physical jobs require trust. Anyone may stop.
-	if !m.trusted(actor) {
-		return nil, fmt.Errorf("physical actions require trusted or admin rank; anyone may use stop_action")
+	if kind == "build" && !m.admin(actor) {
+		return nil, fmt.Errorf("construction requires admin rank")
 	}
 	if j.seconds == 0 {
 		j.seconds = 60
@@ -436,6 +432,10 @@ func (m *actionManager) tick(c *client.Client) {
 	}
 	if j.ctx.Err() != nil || s.me.IsDead() {
 		m.finish(j, "cancelled", "cancelled, dead, or session ended; partial effects were not rolled back")
+		return
+	}
+	if j.status.Kind == "build" && !m.admin(j.status.Owner) {
+		m.finish(j, "cancelled", "construction admin authority was revoked; partial effects were not rolled back")
 		return
 	}
 	if !s.physics.Available() && !(j.status.Kind == "dismount" && j.sent) {
@@ -733,7 +733,7 @@ func (m *actionManager) tools() []toolSpec {
 		return map[string]any{"entity_id": map[string]any{"type": "integer"}, "player": map[string]any{"type": "string", "maxLength": 16}, "seconds": duration}
 	}
 	return []toolSpec{
-		makeTool("move_to", "Start a trusted-only walking/pathfinding job, within 32 blocks and loaded terrain. May open wooden doors. No teleporting. Inspect action_status for completion.", map[string]any{"x": number(), "y": number(), "z": number(), "seconds": duration}, []string{"x", "y", "z"}, func(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
+		makeTool("move_to", "Start a walking/pathfinding job, within 32 blocks and loaded terrain. May open wooden doors. No teleporting. Inspect action_status for completion.", map[string]any{"x": number(), "y": number(), "z": number(), "seconds": duration}, []string{"x", "y", "z"}, func(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
 			var a struct {
 				X       *float64 `json:"x"`
 				Y       *float64 `json:"y"`
@@ -748,10 +748,10 @@ func (m *actionManager) tools() []toolSpec {
 			}
 			return m.submit(ctx, actor, "move", &actionJob{goal: actionPoint{*a.X, *a.Y, *a.Z}, seconds: a.Seconds})
 		}),
-		makeTool("follow_entity", "Follow one loaded entity or visible player algorithmically for at most 120 seconds/32-block radius. Trusted only. Target unload terminates the job.", targetProps(), nil, m.targetTool("follow")),
-		makeTool("fight_entity", "Trusted-only autonomous fight of one loaded mob or player, selected by entity_id or visible player name, with navigation, line of sight, reach and held-item attack cooldown. Server PvP rules still apply. Attacks are not confirmed damage; removal is not proof of a kill.", targetProps(), nil, m.targetTool("fight")),
-		makeTool("mount_entity", "Trusted-only mount of a loaded boat/raft or rideable minecart, with navigation, empty hand and server passenger confirmation.", targetProps(), nil, m.targetTool("mount")),
-		makeTool("dismount", "Trusted-only dismount using real shift input; requires server passenger confirmation.", nil, nil, func(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
+		makeTool("follow_entity", "Follow one loaded entity or visible player algorithmically for at most 120 seconds/32-block radius. Target unload terminates the job.", targetProps(), nil, m.targetTool("follow")),
+		makeTool("fight_entity", "Autonomously fight one loaded mob or player, selected by entity_id or visible player name, with navigation, line of sight, reach and held-item attack cooldown. Server PvP rules still apply. Attacks are not confirmed damage; removal is not proof of a kill.", targetProps(), nil, m.targetTool("fight")),
+		makeTool("mount_entity", "Mount a loaded boat/raft or rideable minecart, with navigation, empty hand and server passenger confirmation.", targetProps(), nil, m.targetTool("mount")),
+		makeTool("dismount", "Dismount using real shift input; requires server passenger confirmation.", nil, nil, func(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
 			if err := decodeArgs(raw, &struct{}{}); err != nil {
 				return nil, err
 			}

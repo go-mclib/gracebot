@@ -130,6 +130,13 @@ func importLegacyPlayers(tx *sql.Tx, reader io.Reader) error {
 			return errors.New("null or duplicate normalized legacy player")
 		}
 		seen[name] = true
+		blocked, err := actorsBlocked(context.Background(), tx, time.Now(), name)
+		if err != nil {
+			return err
+		}
+		if blocked {
+			continue
+		}
 		for _, n := range []int64{p.WordlePoints, p.FirstObserved, p.LastSeen, p.ChatActiveSeconds, p.TotalPlaytimeSeconds, p.Messages, p.MessagesSince, p.ObservedOnlineNanos, p.ObservedSessions, p.PresenceSince} {
 			if n < 0 {
 				return errors.New("negative legacy statistic")
@@ -212,6 +219,10 @@ func importLegacyChat(tx *sql.Tx, reader io.Reader) error {
 			return errors.New("nonsequential legacy event IDs")
 		}
 		last = e.ID
+		if e.Kind == "discord" && strings.HasPrefix(normalizeStoreName(e.Sender), "@discord:") {
+			e.DisplayName = e.Sender[len("@discord:"):]
+			e.Sender = discordBridgeActor
+		}
 		if e.Kind == "private" && e.Owner == "" {
 			e.Owner = e.Sender
 		}

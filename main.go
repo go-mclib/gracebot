@@ -165,6 +165,8 @@ func main() {
 }
 
 func run(ctx context.Context, cfg config) (result error) {
+	ctx, shutdown := context.WithCancel(ctx)
+	defer shutdown()
 	personality, err := os.ReadFile(cfg.personalityPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("read personality: %w", err)
@@ -183,6 +185,7 @@ func run(ctx context.Context, cfg config) (result error) {
 	journal := store.history()
 	output := newChatOutput()
 	output.journal = journal
+	moderation := newChatModeration(store, output.send)
 	activities := newActivities(store, output.send)
 	defer activities.close()
 	web := newWebTools()
@@ -197,17 +200,23 @@ func run(ctx context.Context, cfg config) (result error) {
 	apiConfig := openai.DefaultConfig(cfg.apiKey)
 	apiConfig.BaseURL = cfg.apiBase
 	tools := newToolRegistry(newGameManager(store).tools(), store.tools(), activities.tools(),
-		observations.tools(), web.tools(), journal.tools(), commands.tools(), actions.tools(), []toolSpec{weatherTool()})
+		observations.tools(), web.tools(), journal.tools(), commands.tools(), actions.tools(), moderation.tools(), operatorTools(store, shutdown), []toolSpec{weatherTool()})
+	tools.blocked = func(actor string) bool { return moderation.blocked(actor, time.Now()) }
 	assistant := newAssistant(openai.NewClientWithConfig(apiConfig), cfg.model, string(personality), tools, output.sendMessage)
 	assistant.journal = journal
+	assistant.moderation = moderation
+	moderation.onChange = assistant.moderationChanged
 	assistant.engagements.timeout = cfg.engagementTimeout
 	assistant.engagements.debounce = cfg.debounce
 	workerCtx, stopWorker := context.WithCancel(ctx)
 	workerDone := make(chan struct{})
 	go func() { defer close(workerDone); assistant.run(workerCtx) }()
 	defer func() { stopWorker(); <-workerDone }()
+	moderationDone := make(chan struct{})
+	go func() { defer close(moderationDone); moderation.run(workerCtx) }()
+	defer func() { stopWorker(); <-moderationDone }()
 	router := &chatRouter{assistant: assistant, store: store, aliases: cfg.aliases, journal: journal,
-		observations: observations, commands: commands, actions: actions, consoleChat: cfg.consoleChat}
+		observations: observations, commands: commands, actions: actions, consoleChat: cfg.consoleChat, moderation: moderation}
 	if cfg.consoleInput {
 		consoleDone := make(chan struct{})
 		go func() { defer close(consoleDone); readConsoleInput(workerCtx, router, output) }()
@@ -279,6 +288,7 @@ func connectOnce(ctx context.Context, cfg config, router *chatRouter, output *ch
 	me.SetAutoRespawn(cfg.respawn)
 	c.Register(me)
 	chat := &synchronizedChat{inner: chatmodule.New(), ctx: sessionCtx, client: c, gate: make(chan struct{}, 1)}
+	chat.inner.SuppressChatLogs = true // Only application-approved input may be retained.
 	c.Register(chat)
 	voice := newVoiceChat()
 	c.Register(voice)
@@ -351,6 +361,9 @@ func readConsoleInput(ctx context.Context, router *chatRouter, output *chatOutpu
 			continue
 		}
 		at := time.Now()
+		if !router.admitChat(ctx, consoleActor, "", text, true, at) {
+			continue
+		}
 		id, err := router.journal.appendOwned("console", consoleActor, consoleActor, text, at)
 		if err != nil {
 			log.Printf("record console input: %v", err)
