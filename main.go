@@ -200,7 +200,7 @@ func run(ctx context.Context, cfg config) (result error) {
 	apiConfig := openai.DefaultConfig(cfg.apiKey)
 	apiConfig.BaseURL = cfg.apiBase
 	tools := newToolRegistry(newGameManager(store).tools(), store.tools(), activities.tools(),
-		observations.tools(), web.tools(), journal.tools(), commands.tools(), actions.tools(), moderation.tools(), operatorTools(store, shutdown), []toolSpec{weatherTool()})
+		observations.tools(), inventoryTools(observations, actions), web.tools(), journal.tools(), commands.tools(), actions.tools(), moderation.tools(), operatorTools(store, shutdown), []toolSpec{weatherTool()})
 	tools.blocked = func(actor string) bool { return moderation.blocked(actor, time.Now()) }
 	assistant := newAssistant(openai.NewClientWithConfig(apiConfig), cfg.model, string(personality), tools, output.sendMessage)
 	assistant.journal = journal
@@ -208,6 +208,7 @@ func run(ctx context.Context, cfg config) (result error) {
 	moderation.onChange = assistant.moderationChanged
 	assistant.engagements.timeout = cfg.engagementTimeout
 	assistant.engagements.debounce = cfg.debounce
+	assistant.engagements.setBotNames(cfg.username, cfg.aliases)
 	workerCtx, stopWorker := context.WithCancel(ctx)
 	workerDone := make(chan struct{})
 	go func() { defer close(workerDone); assistant.run(workerCtx) }()
@@ -328,6 +329,7 @@ func connectOnce(ctx context.Context, cfg config, router *chatRouter, output *ch
 		})
 		activities.bindVoice(voice)
 		log.Printf("Listening for current username %q and aliases %q", c.Username, cfg.aliases)
+		router.assistant.engagements.setBotNames(c.Username, cfg.aliases)
 	})
 	c.OnTransfer(func() { activities.bindVoice(nil); output.bind(nil, ""); router.disconnect() })
 	c.OnDisconnect(func() { cancel(); activities.bindVoice(nil); output.bind(nil, ""); router.disconnect() })

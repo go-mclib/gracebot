@@ -28,6 +28,7 @@ import (
 
 const actionRadius = 32.0
 const actionHistoryLimit = 12
+const maxMoveSeconds = 3600
 
 type actionPoint struct {
 	X float64 `json:"x"`
@@ -75,6 +76,9 @@ type actionSession struct {
 	ticks            atomic.Uint64
 	attacks          atomic.Int64
 	navigationResult atomic.Int32 // 0 pending, 1 reached, -1 failed
+	blockAck         int32
+	containerWindow  int32
+	containerReady   bool
 }
 
 type actionJob struct {
@@ -98,6 +102,7 @@ type actionJob struct {
 	sentAt           time.Time
 	passengerVersion uint64
 	build            *buildPlan
+	interact         *interactionPlan
 }
 
 type actionManager struct {
@@ -126,7 +131,6 @@ func (m *actionManager) register(c *client.Client) {
 	nav := pathfinding.From(c)
 	if nav == nil {
 		nav = pathfinding.New()
-		nav.MaxNodes = 4096
 		c.Register(nav)
 	}
 	fighter := combat.From(c)
@@ -202,12 +206,31 @@ func (s *actionSession) observe(pkt *jp.WirePacket) {
 		if pkt.ReadInto(&d) == nil {
 			s.positionKnown = true
 		}
+	case packet_ids.S2COpenScreenID:
+		var d packets.S2COpenScreen
+		if pkt.ReadInto(&d) == nil {
+			s.containerWindow, s.containerReady = int32(d.WindowId), false
+		}
+	case packet_ids.S2CContainerCloseID:
+		var d packets.S2CContainerClose
+		if pkt.ReadInto(&d) == nil && int32(d.WindowId) == s.containerWindow {
+			s.containerWindow, s.containerReady = 0, false
+		}
+	case packet_ids.S2CBlockChangedAckID:
+		var d packets.S2CBlockChangedAck
+		if pkt.ReadInto(&d) == nil {
+			s.blockAck = int32(d.SequenceId)
+		}
 	case packet_ids.S2CContainerSetContentID:
 		var d packets.S2CContainerSetContent
-		if pkt.ReadInto(&d) == nil && d.WindowId == 0 {
-			s.inventoryKnown = true
-			for i := range s.slotVersion {
-				s.slotVersion[i]++
+		if pkt.ReadInto(&d) == nil {
+			if d.WindowId == 0 {
+				s.inventoryKnown = true
+				for i := range s.slotVersion {
+					s.slotVersion[i]++
+				}
+			} else if int32(d.WindowId) == s.containerWindow {
+				s.containerReady = true
 			}
 		}
 	case packet_ids.S2CSetPlayerInventoryID:
@@ -320,11 +343,18 @@ func (m *actionManager) submit(ctx context.Context, actor, kind string, j *actio
 	if kind == "build" && !m.admin(actor) {
 		return nil, fmt.Errorf("construction requires admin rank")
 	}
+	maxSeconds := 120
+	if kind == "move" {
+		maxSeconds = maxMoveSeconds
+		if j.seconds == 0 {
+			j.seconds = 600
+		}
+	}
 	if j.seconds == 0 {
 		j.seconds = 60
 	}
-	if j.seconds < 1 || j.seconds > 120 {
-		return nil, fmt.Errorf("seconds must be 1..120")
+	if j.seconds < 1 || j.seconds > maxSeconds {
+		return nil, fmt.Errorf("seconds must be 1..%d", maxSeconds)
 	}
 	m.controlMu.Lock()
 	defer m.controlMu.Unlock()
@@ -447,7 +477,7 @@ func (m *actionManager) tick(c *client.Client) {
 		j.initialized = true
 		j.status.State = "running"
 	}
-	if !finitePosition(j.origin.X, j.origin.Y, j.origin.Z) || actionPosition(s.me).distance(j.origin) > actionRadius {
+	if !finitePosition(j.origin.X, j.origin.Y, j.origin.Z) || j.status.Kind != "move" && actionPosition(s.me).distance(j.origin) > actionRadius {
 		m.finish(j, "failed", "action radius exceeded")
 		return
 	}
@@ -462,6 +492,8 @@ func (m *actionManager) tick(c *client.Client) {
 		done, err = j.followTick(true)
 	case "mount", "dismount":
 		done, err = j.mountTick()
+	case "interact_block", "interact_entity":
+		done, err = j.interactTick()
 	case "build":
 		done, err = j.buildTick()
 	}
@@ -474,7 +506,11 @@ func (m *actionManager) tick(c *client.Client) {
 		return
 	}
 	if done {
-		m.finish(j, "succeeded", j.status.Detail)
+		state := "succeeded"
+		if j.interact != nil && !j.interact.confirmed {
+			state = "submitted"
+		}
+		m.finish(j, state, j.status.Detail)
 		return
 	}
 	j.status.Attacks = s.attacks.Load() - j.attackStart
@@ -490,8 +526,14 @@ func (j *actionJob) send(pkt jp.Packet) error {
 	return j.session.physics.QueuePacketContext(j.ctx, pkt)
 }
 func (j *actionJob) checkPoint(p actionPoint) error {
-	if !finitePosition(p.X, p.Y, p.Z) || p.Y < -2048 || p.Y > 2047 || p.distance(j.origin) > actionRadius {
-		return fmt.Errorf("target must be finite and within %g blocks of action start", actionRadius)
+	if !finitePosition(p.X, p.Y, p.Z) || p.Y < -2048 || p.Y > 2047 {
+		return fmt.Errorf("target must be finite and within world coordinates")
+	}
+	if j.status.Kind == "move" {
+		return nil
+	}
+	if p.distance(j.origin) > actionRadius {
+		return fmt.Errorf("target must be within %g blocks of action start", actionRadius)
 	}
 	for dy := -1; dy <= 2; dy++ {
 		if _, ok := j.session.world.GetLoadedBlock(int(math.Floor(p.X)), int(math.Floor(p.Y))+dy, int(math.Floor(p.Z))); !ok {
@@ -733,7 +775,7 @@ func (m *actionManager) tools() []toolSpec {
 		return map[string]any{"entity_id": map[string]any{"type": "integer"}, "player": map[string]any{"type": "string", "maxLength": 16}, "seconds": duration}
 	}
 	return []toolSpec{
-		makeTool("move_to", "Start a walking/pathfinding job, within 32 blocks and loaded terrain. May open wooden doors. No teleporting. Inspect action_status for completion.", map[string]any{"x": number(), "y": number(), "z": number(), "seconds": duration}, []string{"x", "y", "z"}, func(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
+		makeTool("move_to", "Start a walking navigation job to absolute coordinates, including beyond render distance. Explores loaded terrain toward the goal and replans as chunks arrive or terrain changes; unknown chunks are never assumed to be air. May open wooden doors; no teleporting, mining or block placement. Default 600 seconds, maximum 3600; action_status reports actual completion.", map[string]any{"x": number(), "y": number(), "z": number(), "seconds": map[string]any{"type": "integer", "minimum": 1, "maximum": maxMoveSeconds}}, []string{"x", "y", "z"}, func(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
 			var a struct {
 				X       *float64 `json:"x"`
 				Y       *float64 `json:"y"`
@@ -773,6 +815,8 @@ func (m *actionManager) tools() []toolSpec {
 			return map[string]any{"current": m.published, "history": append([]actionStatus(nil), m.history...)}, nil
 		}),
 		m.buildTool(),
+		m.interactBlockTool(),
+		m.interactEntityTool(),
 	}
 }
 func (m *actionManager) targetTool(kind string) func(context.Context, string, json.RawMessage) (any, error) {

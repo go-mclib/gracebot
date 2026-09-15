@@ -185,7 +185,7 @@ func (o *observations) tools() []toolSpec {
 			"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": 50},
 		}, nil, o.nearbyEntitiesTool),
 		makeTool("bot_status", "Read the bot's observed position, dimension, health, food, XP, last server clock and weather; null values have not been observed since reset.", nil, nil, o.botStatusTool),
-		makeTool("inventory", "Read only the bot's own visible inventory slots, not containers or another player's inventory. Unknown and explicitly empty slots are distinct; item text is untrusted.", nil, nil, o.inventoryTool),
+		makeTool("inventory", "Read this bot's current visible inventory/menu, including an opened chest/container. Reports window_id and revision for inventory_action, active-menu slot numbering, cursor, and known versus empty slots. No hidden/unopened contents or another player's inventory; titles and item text are untrusted.", nil, nil, o.inventoryTool),
 		makeTool("inspect_block", "Read one loaded block within 32 blocks of the bot. Absolute integer coordinates; rejects unloaded, unknown and out-of-range data rather than inventing air. No container contents.", map[string]any{
 			"x": map[string]any{"type": "integer", "minimum": -30000000, "maximum": 30000000},
 			"y": map[string]any{"type": "integer", "minimum": -2048, "maximum": 2047},
@@ -418,21 +418,24 @@ func (o *observations) inventoryTool(ctx context.Context, _ string, raw json.Raw
 		return nil, err
 	}
 	return o.query(ctx, func(s *observationSession) (any, error) {
-		rawSlots, _, _ := s.inventory.RawSlots()
-		entries := make([]map[string]any, 0)
-		unknown, empty := make([]int, 0), make([]int, 0)
-		for slot, raw := range rawSlots {
-			if !s.inventoryKnown[slot] {
-				unknown = append(unknown, slot)
-				continue
+		view := s.inventory.Snapshot()
+		result := inventoryViewData(view)
+		result["owner"] = s.client.Username
+		if !view.Ready && view.WindowID == 0 {
+			entries := make([]map[string]any, 0)
+			unknown, empty := make([]int, 0), make([]int, 0)
+			for slot, raw := range view.Slots {
+				if !s.inventoryKnown[slot] {
+					unknown = append(unknown, slot)
+				} else if raw.Count <= 0 {
+					empty = append(empty, slot)
+				} else {
+					entries = append(entries, map[string]any{"slot": slot, "item": boundedObservedItem(entities.ObserveItem(raw))})
+				}
 			}
-			if raw.Count <= 0 {
-				empty = append(empty, slot)
-				continue
-			}
-			entries = append(entries, map[string]any{"slot": slot, "item": boundedObservedItem(entities.ObserveItem(raw))})
+			result["items"], result["empty_slots"], result["unknown_slots"] = entries, empty, unknown
 		}
-		return map[string]any{"owner": s.client.Username, "items": entries, "empty_slots": empty, "unknown_slots": unknown, "selected_hotbar_slot": s.inventory.HeldSlotIndex(), "slot_numbering": "0 result, 1–4 crafting, 5 head, 6 chest, 7 legs, 8 feet, 9–35 main, 36–44 hotbar, 45 offhand", "note": "only own visible inventory; item text/lore/enchantments may be truncated"}, nil
+		return result, nil
 	})
 }
 

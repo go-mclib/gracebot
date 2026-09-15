@@ -54,8 +54,8 @@ func TestDiscordSystemChatEngagementAndCaptureIsolation(t *testing.T) {
 	send(ns.NewTextComponent("[Discord] SOME   用户 🌍 » and what about tomorrow?"))
 	send(ns.NewTextComponent("[Discord] Other User » unrelated follow-up"))
 	request, _, ready = a.engagements.take(time.Now().Add(3 * time.Second))
-	if !ready || request.sender != discordBridgeActor || len(request.messages) != 2 || request.messages[0].Text != "and what about tomorrow?" || request.messages[1].DisplayName != "Other User" || request.mentioned {
-		t.Fatalf("Discord speakers did not share a labelled bridge conversation: %+v", request)
+	if !ready || request.sender != discordBridgeActor || len(request.messages) != 1 || request.messages[0].Text != "and what about tomorrow?" || request.mentioned {
+		t.Fatalf("unrelated Discord display diverted the focused bridge conversation: %+v", request)
 	}
 	if _, _, ready := a.engagements.take(time.Now().Add(3 * time.Second)); ready {
 		t.Fatal("shared bridge batch was delivered twice")
@@ -146,8 +146,8 @@ func TestDiscordSystemChatWireComponents(t *testing.T) {
 			if _, _, ready := a.engagements.take(time.Now().Add(3 * time.Second)); ready {
 				t.Fatal("unmentioned reported bridge frame started an engagement")
 			}
-			// A mention starts the shared bridge conversation; subsequent
-			// structured packets continue it without nickname-specific identity.
+			// A mention starts the shared bridge actor's conversation; packets
+			// from its focused display continue without another mention.
 			mention, err := jp.ToWire(&packets.S2CSystemChat{Content: ns.NewTextComponent("[Discord] Eragon » grace hello")})
 			if err != nil {
 				t.Fatal(err)
@@ -328,5 +328,86 @@ func TestDiscordPublicReplyUsesMinecraftChat(t *testing.T) {
 	}
 	if entries := historyEntries(t, store.history(), "alice", `{"kind":"bot"}`); len(entries) != 1 || entries[0].Text != public[0] || entries[0].Owner != "" {
 		t.Fatalf("Discord response was not archived publicly: %+v", entries)
+	}
+}
+
+func TestSystemMessagesRetainAnnouncementsOverlaysAndSeparators(t *testing.T) {
+	store := testPlayerStore(t)
+	a := newAssistant(nil, "model", "", newToolRegistry(), nil)
+	defer a.engagements.reset()
+	r := &chatRouter{assistant: a, store: store, journal: store.history()}
+	c := client.New("unused", "GraceLocal", false)
+	c.SetState(jp.StatePlay)
+	handler := r.handler(context.Background(), playerlist.New())
+	send := func(content ns.TextComponent, overlay bool) {
+		t.Helper()
+		wire, err := jp.ToWire(&packets.S2CSystemChat{Content: content, Overlay: ns.Boolean(overlay)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		handler(c, wire)
+	}
+	send(ns.TextComponent{Translate: "chat.type.advancement.task", With: []ns.TextComponent{
+		ns.NewTextComponent("GraceLocal"), ns.NewTextComponent("[STONE_ADVANCEMENT]"),
+	}}, false)
+	send(ns.TextComponent{Translate: "chat.type.advancement.challenge", With: []ns.TextComponent{
+		ns.NewTextComponent("Alice"), ns.NewTextComponent("[CHALLENGE_ADVANCEMENT]"),
+	}}, false)
+	send(ns.NewTextComponent("PRIVATE_ACTION_BAR"), true)
+	send(ns.NewTextComponent("LATE_PLUGIN_FEEDBACK"), false)
+	send(ns.NewTextComponent(""), false)
+
+	rows, err := store.db.Query("SELECT text, owner FROM events WHERE kind='system' ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	saved := make(map[string]string)
+	for rows.Next() {
+		var text, owner string
+		if err := rows.Scan(&text, &owner); err != nil {
+			t.Fatal(err)
+		}
+		saved[text] = owner
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(saved) != 5 {
+		t.Fatalf("system messages were dropped: %v", saved)
+	}
+	for _, text := range []string{"PRIVATE_ACTION_BAR", "LATE_PLUGIN_FEEDBACK", ""} {
+		if saved[text] != "@unattributed" {
+			t.Fatalf("unclassified system text lost quarantine: %q owner=%q", text, saved[text])
+		}
+	}
+	public := r.journal.recentContext(0, "Bob")
+	if !strings.Contains(public, "STONE_ADVANCEMENT") || !strings.Contains(public, "CHALLENGE_ADVANCEMENT") {
+		t.Fatalf("public advancements were not available as history: %s", public)
+	}
+	if strings.Contains(public, "PRIVATE_ACTION_BAR") || strings.Contains(public, "LATE_PLUGIN_FEEDBACK") {
+		t.Fatalf("unclassified system data entered public context: %s", public)
+	}
+	if _, _, ready := a.engagements.take(time.Now().Add(3 * time.Second)); ready {
+		t.Fatal("system message scheduled a model call")
+	}
+}
+
+func TestMentionUsesWholeNameBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		text string
+		want bool
+	}{
+		{"that was graceful", false},
+		{"megagrace", false},
+		{"grace_2", false},
+		{"graceα", false},
+		{"你好grace", false},
+		{"hey, @GRACE!", true},
+		{"graceful then grace help", true},
+	} {
+		if got := mentioned(tc.text, "GraceLocal", []string{"grace"}); got != tc.want {
+			t.Errorf("mentioned(%q)=%v, want %v", tc.text, got, tc.want)
+		}
 	}
 }

@@ -16,25 +16,35 @@ const (
 
 type engagement struct {
 	revision       uint64
+	conversationID uint64
+	lastInput      time.Time
+	completed      bool
+	focus          string
 	until, readyAt time.Time
 	request        chatRequest
 	cancel         context.CancelFunc
 }
 
-// Packet handlers only enqueue. A single worker takes quiet batches; new input
-// cancels an obsolete turn before its remaining tools or messages can execute.
+// Chat handlers persist eligible input before this gate. Only a mention or a
+// live conversation queues a model turn; idle chat stays local. A single worker
+// takes quiet batches; new input cancels an obsolete turn before its remaining
+// tools or messages can execute.
 // Expiry is measured from incoming messages, never from a reply or tool result.
 type conversationEngagement struct {
 	mu                sync.Mutex
 	timeout, debounce time.Duration
 	next              uint64
+	nextConversation  uint64
+	names             map[string]time.Time
+	botNames          map[string]bool
+	prompts           []routingPrompt
 	players           map[string]*engagement
 	wake              chan struct{}
 }
 
 func newConversationEngagement(timeout time.Duration) *conversationEngagement {
 	return &conversationEngagement{timeout: timeout, debounce: defaultChatDebounce,
-		players: make(map[string]*engagement), wake: make(chan struct{}, 1)}
+		players: make(map[string]*engagement), names: make(map[string]time.Time), wake: make(chan struct{}, 1)}
 }
 
 func (e *conversationEngagement) signal() {
@@ -47,8 +57,12 @@ func (e *conversationEngagement) signal() {
 func (e *conversationEngagement) enqueue(request chatRequest) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if len(request.messages) == 0 {
+		return false
+	}
 	key := strings.ToLower(request.sender)
-	at := request.messages[len(request.messages)-1].At
+	last := request.messages[len(request.messages)-1]
+	at := last.At
 	state := e.players[key]
 	if state != nil && (!at.Before(state.until) || state.request.ctx.Err() != nil) {
 		if state.cancel != nil {
@@ -57,7 +71,29 @@ func (e *conversationEngagement) enqueue(request chatRequest) bool {
 		delete(e.players, key)
 		state = nil
 	}
+	// An unmentioned bridge nickname is not the focused participant, but it
+	// remains the same actor for storage, privileges and explicit mentions.
+	if state != nil && isDiscordActor(request.sender) && routingName(last.DisplayName) != state.focus && !request.mentioned {
+		return false
+	}
+	diverted := false
+	for _, fragment := range request.messages {
+		recipient := addressedPlayer(fragment.Text, e.names)
+		if recipient != "" && !strings.EqualFold(recipient, request.username) && !e.botNames[recipient] {
+			diverted = true
+		}
+	}
+	if diverted || !request.mentioned && (endsConversation(last.Text) || state != nil && e.competingPrompt(state, last.Text, at)) {
+		if state != nil {
+			e.closeLocked(key)
+		}
+		return false
+	}
 	if !request.mentioned && (state == nil || e.timeout == 0) {
+		return false
+	}
+	if state != nil && !request.mentioned && state.completed && !contextualFollowup(last.Text) {
+		e.closeLocked(key)
 		return false
 	}
 	if state == nil {
@@ -73,7 +109,8 @@ func (e *conversationEngagement) enqueue(request chatRequest) bool {
 			}
 			delete(e.players, oldest)
 		}
-		state = &engagement{}
+		e.nextConversation++
+		state = &engagement{conversationID: e.nextConversation}
 		e.players[key] = state
 	}
 	if state.cancel != nil {
@@ -83,15 +120,20 @@ func (e *conversationEngagement) enqueue(request chatRequest) bool {
 	pending := state.request.messages
 	omitted := state.request.omitted
 	mention := state.request.mentioned
-	if len(pending) == maxPendingMessages {
-		copy(pending, pending[1:])
-		pending = pending[:len(pending)-1]
-		omitted++
+	for _, fragment := range request.messages {
+		if len(pending) == maxPendingMessages {
+			copy(pending, pending[1:])
+			pending = pending[:len(pending)-1]
+			omitted++
+		}
+		pending = append(pending, fragment)
 	}
-	pending = append(pending, request.messages...)
 	e.next++
 	state.revision = e.next
 	state.until = at.Add(e.timeout)
+	state.lastInput = at
+	state.completed = false
+	state.focus = routingName(last.DisplayName)
 	if e.timeout == 0 {
 		state.until = at.Add(defaultEngagementTimeout)
 	}
@@ -101,6 +143,7 @@ func (e *conversationEngagement) enqueue(request chatRequest) bool {
 	state.request.omitted = omitted
 	state.request.mentioned = mention || request.mentioned
 	state.request.revision = state.revision
+	state.request.conversationID = state.conversationID
 	e.signal()
 	return true
 }
@@ -161,7 +204,23 @@ func (e *conversationEngagement) finish(request chatRequest, decision string) {
 		}
 		if decision == "disengage" {
 			delete(e.players, key)
+		} else if decision != "wait" {
+			// Responses never refresh engagement. A completed answer gets
+			// only a short contextual follow-up window, even if the model
+			// accidentally leaves the conversation open.
+			state.completed = true
+			state.until = minTime(state.until, state.lastInput.Add(completedFollowupWindow))
 		}
+	}
+}
+
+func (e *conversationEngagement) closeLocked(key string) {
+	if state := e.players[key]; state != nil {
+		if state.cancel != nil {
+			state.cancel()
+		}
+		delete(e.players, key)
+		e.signal()
 	}
 }
 
@@ -188,5 +247,7 @@ func (e *conversationEngagement) reset() {
 		}
 	}
 	clear(e.players)
+	clear(e.names)
+	e.prompts = nil
 	e.signal()
 }

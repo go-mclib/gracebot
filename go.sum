@@ -32,6 +32,8 @@ github.com/go-mclib/client v0.0.0-20260915061840-a8c42c0f0e3d h1:hEEIbUYNdBci4sy
 github.com/go-mclib/client v0.0.0-20260915061840-a8c42c0f0e3d/go.mod h1:B5QMrP8lvGkoe+U1q6LokdnW9BB0tXubTtVPRSm0Tfs=
 github.com/go-mclib/client v0.0.0-20260915114228-940c42c7a89f h1:Aw+CuqjqpinZF+KyTf2lJr8MNDYxxex9nrq+TLtm36s=
 github.com/go-mclib/client v0.0.0-20260915114228-940c42c7a89f/go.mod h1:B5QMrP8lvGkoe+U1q6LokdnW9BB0tXubTtVPRSm0Tfs=
+github.com/go-mclib/client v0.0.0-20260915172003-612bf193f00c h1:d6df/GaRGQYOC6O8mKZ9n1ibh/fJ+zXTUMWfXmEKLoE=
+github.com/go-mclib/client v0.0.0-20260915172003-612bf193f00c/go.mod h1:B5QMrP8lvGkoe+U1q6LokdnW9BB0tXubTtVPRSm0Tfs=
 github.com/go-mclib/data v0.0.0-20260915044945-8957c18fe1a8 h1:6DEVRDdQ7DQ2AAL4Hf3da14Kg5cwR6TfLQMS7VpT0Ao=
 github.com/go-mclib/data v0.0.0-20260915044945-8957c18fe1a8/go.mod h1:7zjLTB2KwMiQVcRXrxK2m+2ssYgxOeUmY6311bLVD9Y=
 github.com/go-mclib/protocol v0.0.0-20260915052648-6c01ecdcc533 h1:o8Q0GSnvrDgia0vWsFdmgJOMRWpQbGfzboRB1H9HVfQ=

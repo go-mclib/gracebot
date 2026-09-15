@@ -36,11 +36,33 @@ func parseAliases(value string) []string {
 
 func mentioned(message, username string, aliases []string) bool {
 	message = strings.ToLower(message)
-	if username != "" && strings.Contains(message, strings.ToLower(username)) {
+	word := func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' }
+	matches := func(name string) bool {
+		name = strings.ToLower(name)
+		if name == "" {
+			return false
+		}
+		for offset := 0; offset <= len(message)-len(name); {
+			found := strings.Index(message[offset:], name)
+			if found < 0 {
+				return false
+			}
+			start := offset + found
+			end := start + len(name)
+			before, _ := utf8.DecodeLastRuneInString(message[:start])
+			after, _ := utf8.DecodeRuneInString(message[end:])
+			if (start == 0 || !word(before)) && (end == len(message) || !word(after)) {
+				return true
+			}
+			offset = end
+		}
+		return false
+	}
+	if matches(username) {
 		return true
 	}
 	for _, alias := range aliases {
-		if alias != "" && strings.Contains(message, alias) {
+		if matches(alias) {
 			return true
 		}
 	}
@@ -98,6 +120,7 @@ func (r *chatRouter) discordChat(ctx context.Context, username, text string, at 
 		return true
 	}
 	if id != 0 {
+		r.assistant.engagements.observe(discordBridgeActor, display, match[2], at)
 		r.assistant.engagements.enqueue(chatRequest{sender: discordBridgeActor, username: username, ctx: ctx,
 			mentioned: mentioned(match[2], username, r.aliases),
 			messages:  []chatFragment{{ID: id, At: at, Text: match[2], DisplayName: display}}})
@@ -131,6 +154,7 @@ func (r *chatRouter) playerChat(ctx context.Context, username, sender, message s
 		return
 	}
 	if eventID != 0 {
+		r.assistant.engagements.observe(sender, "", message, at)
 		r.enqueue(ctx, username, sender, message, eventID, at, mentioned(message, username, r.aliases))
 	}
 }
@@ -190,6 +214,7 @@ func (r *chatRouter) handler(ctx context.Context, players *playerlist.Module) cl
 				if player.Name != "" {
 					names = append(names, player.Name)
 					r.moderation.noteSpeaker(player.Name, "", time.Now())
+					r.assistant.engagements.observe(player.Name, "", "", time.Now())
 				}
 			}
 			if err := r.store.recordPresence(names, time.Now()); err != nil {
@@ -238,10 +263,15 @@ func (r *chatRouter) handler(ctx context.Context, players *playerlist.Module) cl
 				log.Printf("decode system chat: %v", err)
 				return
 			}
+			text, at := packet.Content.Render(lang.Translate), time.Now()
 			if bool(packet.Overlay) {
+				// Action-bar text is still system history, never a bridge input or
+				// an invitation to reply. Unknown recipients remain quarantined.
+				if !strings.HasPrefix(text, "[Discord]") || !r.moderation.blocked(discordBridgeActor, at) {
+					r.rememberInternal("system", "", text)
+				}
 				return
 			}
-			text, at := packet.Content.Render(lang.Translate), time.Now()
 			if r.discordChat(ctx, c.Username, text, at) {
 				return
 			}
@@ -253,7 +283,7 @@ func (r *chatRouter) handler(ctx context.Context, players *playerlist.Module) cl
 				if err := r.store.recordDeath(packet.Content.With[0].String(), packet.Content.Translate); err != nil {
 					log.Printf("record death: %v", err)
 				}
-			} else if packet.Content.Translate == "multiplayer.player.joined" || packet.Content.Translate == "multiplayer.player.left" {
+			} else if publicSystemAnnouncement(packet.Content.Translate) {
 				if len(packet.Content.With) > 0 && r.moderation.blocked(packet.Content.With[0].String(), at) {
 					return
 				}
@@ -298,6 +328,16 @@ func (r *chatRouter) handler(ctx context.Context, players *playerlist.Module) cl
 				r.enqueue(ctx, c.Username, "@server", text, id, at, mentioned(text, c.Username, r.aliases))
 			}
 		}
+	}
+}
+
+func publicSystemAnnouncement(translation string) bool {
+	switch translation {
+	case "multiplayer.player.joined", "multiplayer.player.joined.renamed", "multiplayer.player.left",
+		"chat.type.advancement.task", "chat.type.advancement.goal", "chat.type.advancement.challenge":
+		return true
+	default:
+		return false
 	}
 }
 

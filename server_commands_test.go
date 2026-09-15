@@ -23,81 +23,49 @@ func commandStore(t *testing.T) *playerStore {
 	return s
 }
 func TestServerCommandSafetyAndAuthority(t *testing.T) {
-	store := commandStore(t)
-	if _, err := store.setRankTool(context.Background(), consoleActor, json.RawMessage(`{"player":"Bob","rank":"trusted","action":"add"}`)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.setRankTool(context.Background(), consoleActor, json.RawMessage(`{"player":"Root","rank":"admin","action":"add"}`)); err != nil {
-		t.Fatal(err)
-	}
-	s := newServerCommands(store)
+	s := newServerCommands(commandStore(t))
 	s.window = time.Millisecond
-	s.bind(func(context.Context, string) error { return nil })
-	defer s.close()
-	for _, command := range []string{"help\nstop", "help\rstop", "help\x00", "help\tstop", "help\u2028stop", "//help", "", strings.Repeat("x", 2049), "help\u202estop"} {
-		if _, err := s.execute(context.Background(), "alice", command); err == nil {
-			t.Errorf("unsafe command accepted: %q", command)
-		}
-	}
-	for _, actor := range []string{"alice", "Bob"} {
-		for _, command := range []string{"stop", "minecraft:help", "help @a", "list uuids", "plugins reload", "help a b", "version --reload"} {
-			if _, err := s.execute(context.Background(), actor, command); err == nil {
-				t.Errorf("non-admin %s command accepted: %q", actor, command)
-			}
-		}
-	}
-	for _, command := range []string{"/help", "plugins", "help 2", "help teleport", "version Essentials", "list"} {
-		value, err := s.execute(context.Background(), "alice", command)
-		if err != nil {
-			t.Fatal(err)
-		}
-		r := value.(commandResult)
-		if !r.Submitted || r.Confirmed {
-			t.Fatalf("dishonest result: %+v", r)
-		}
-	}
-	stopped := false
-	s.BeforeMutation = func() { stopped = true }
-	value, err := s.execute(context.Background(), "Root", "time query daytime")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !value.(commandResult).Submitted {
-		t.Fatalf("admin command was not submitted: %+v", value)
-	}
-	if !stopped {
-		t.Fatal("mutating command did not stop physical action")
-	}
-}
-
-func TestServerCommandRevokedAdminCannotSubmitAfterMutationBarrier(t *testing.T) {
-	store := commandStore(t)
-	for _, rank := range []string{"trusted", "admin"} {
-		raw := json.RawMessage(`{"player":"Alice","rank":"` + rank + `","action":"add"}`)
-		if _, err := store.setRankTool(context.Background(), consoleActor, raw); err != nil {
-			t.Fatal(err)
-		}
-	}
-	s := newServerCommands(store)
-	s.bind(func(context.Context, string) error {
-		t.Error("revoked admin command reached Minecraft")
+	var sent []string
+	s.bind(func(_ context.Context, command string) error {
+		sent = append(sent, command)
 		return nil
 	})
 	defer s.close()
-	revoked := make(chan error, 1)
-	s.BeforeMutation = func() {
-		_, err := store.setRankTool(context.Background(), consoleActor, json.RawMessage(`{"player":"Alice","rank":"admin","action":"remove"}`))
-		revoked <- err
+	for _, command := range []string{"help\nstop", "help\rstop", "help\x00", "help\tstop", "help\u2028stop", "//help", "", strings.Repeat("x", 2049), "help\u202estop"} {
+		if _, err := s.execute(context.Background(), "Alice", command); err == nil {
+			t.Errorf("unsafe command accepted: %q", command)
+		}
 	}
-	value, err := s.execute(context.Background(), "Alice", "time query daytime")
-	if err != nil {
-		t.Fatal(err)
+	for _, actor := range []string{"", "@server", "@discord:alice", "not a username"} {
+		if _, err := s.execute(context.Background(), actor, "help"); err == nil {
+			t.Errorf("unauthenticated actor accepted: %q", actor)
+		}
 	}
-	if err := <-revoked; err != nil {
-		t.Fatal(err)
+	if len(sent) != 0 {
+		t.Fatalf("rejected input reached Minecraft: %q", sent)
 	}
-	if value.(commandResult).Submitted {
-		t.Fatal("trusted rank retained revoked admin command authority")
+	stopped := false
+	s.BeforeMutation = func() { stopped = true }
+	for _, tc := range []struct {
+		command string
+		stops   bool
+	}{
+		{"/help", false},
+		{"/minecraft:execute as @a run say hello", true},
+	} {
+		stopped = false
+		before := len(sent)
+		value, err := s.execute(context.Background(), "Alice", tc.command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result := value.(commandResult)
+		if !result.Submitted || result.Confirmed || len(sent) != before+1 || sent[before] != strings.TrimPrefix(tc.command, "/") {
+			t.Fatalf("unranked request %q was not submitted exactly once: %+v; sent=%q", tc.command, result, sent)
+		}
+		if stopped != tc.stops {
+			t.Fatalf("command %q interrupted physical action=%t, want %t", tc.command, stopped, tc.stops)
+		}
 	}
 }
 
@@ -172,7 +140,7 @@ func TestServerCommandPrivateFeedbackAndBounds(t *testing.T) {
 		return nil
 	})
 	defer s.close()
-	value, err := s.execute(context.Background(), "alice", "help")
+	value, err := s.execute(context.Background(), "alice", "balance")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -39,7 +39,7 @@ func TestStructuredRepliesNeverPublishCommentaryOrSpeakerPrefixes(t *testing.T) 
 	out.bind(func(_ context.Context, text string) error { published = append(published, text); return nil }, "GraceLocal")
 	want := []string{"&ahey whats up&r", `<hover:show_text:'<gold>gold'>hello</hover>`}
 	api := completionFunc(func(context.Context, openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
-		response := responseCompletion("continue", want...)
+		response := responseCompletion("disengage", want...)
 		response.Choices[0].Message.Content = "<thinking>private commentary mentioning Alice</thinking>\nAlice: copied transcript"
 		return response, nil
 	})
@@ -74,7 +74,7 @@ func TestInvalidPublicOutputCannotLeakOrSplitIntoChat(t *testing.T) {
 }
 
 func TestWaitingAndDisengagingAreSilentUntilNewInput(t *testing.T) {
-	answers := []string{"wait", "continue", "disengage"}
+	answers := []string{"wait", "continue"}
 	calls, replies := 0, 0
 	a := newAssistant(completionFunc(func(context.Context, openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
 		decision := answers[calls]
@@ -101,9 +101,13 @@ func TestWaitingAndDisengagingAreSilentUntilNewInput(t *testing.T) {
 	}
 	a.engagements.enqueue(fragmentRequest(context.Background(), "Alice", "not do that", at.Add(8*time.Second), false, 2))
 	consume(at.Add(10 * time.Second))
-	a.engagements.enqueue(fragmentRequest(context.Background(), "Alice", "bob are you selling iron", at.Add(12*time.Second), false, 3))
-	consume(at.Add(14 * time.Second))
-	if calls != 3 || replies != 1 {
+	if a.engagements.enqueue(fragmentRequest(context.Background(), "Alice", "bob are you selling iron", at.Add(12*time.Second), false, 3)) {
+		t.Fatal("another addressee reached the model")
+	}
+	if _, _, ready := a.engagements.take(at.Add(14 * time.Second)); ready {
+		t.Fatal("diverted ambient chat produced model work")
+	}
+	if calls != 2 || replies != 1 {
 		t.Fatal("conversation decisions needed a classifier or interrupted other players")
 	}
 	if a.engagements.enqueue(fragmentRequest(context.Background(), "Alice", "still talking to bob", at.Add(15*time.Second), false, 4)) {
@@ -348,5 +352,104 @@ func TestRequestedAudienceCanReturnFromWhispersToPublicChat(t *testing.T) {
 	a.handleRequest(context.Background(), fragmentRequest(context.Background(), "Alice", "stop using msg and reply publicly", time.Now(), true, 2))
 	if !reflect.DeepEqual(private, []string{"a private hello"}) || !reflect.DeepEqual(public, []string{"back in public chat"}) {
 		t.Fatalf("audience switch failed: private=%q public=%q", private, public)
+	}
+}
+
+func TestIdleChatIsCapturedWithoutCallingModel(t *testing.T) {
+	r, m := moderationFixture(t)
+	a := r.assistant
+	ctx := context.Background()
+	if _, err := m.block(ctx, "RealAdmin", "BlockedOne", "minecraft", "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.journal.append("private", "Bob", "CAPTURE_PRIVATE_SECRET", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	var requests []string
+	decision := "wait"
+	a.client = completionFunc(func(_ context.Context, request openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+		data, err := json.Marshal(request.Messages)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(data)
+		if strings.Contains(text, "CAPTURE_PRIVATE_SECRET") || strings.Contains(text, "CAPTURE_BLOCKED_SECRET") {
+			t.Fatal("automatic context exposed private or blocked input")
+		}
+		requests = append(requests, text)
+		if decision == "continue" {
+			return responseCompletion(decision, "noted"), nil
+		}
+		return responseCompletion(decision), nil
+	})
+	a.send = func(context.Context, string) error { return nil }
+	drain := func(want int) {
+		t.Helper()
+		for {
+			request, _, ready := a.engagements.take(time.Now().Add(3 * time.Second))
+			if !ready {
+				break
+			}
+			a.handleRequest(ctx, request)
+		}
+		if len(requests) != want {
+			t.Fatalf("model calls = %d, want %d", len(requests), want)
+		}
+	}
+	player := func(name, text string) { r.playerChat(ctx, "GraceLocal", name, text) }
+	discord := func(name, text string) {
+		r.discordChat(ctx, "GraceLocal", "[Discord] "+name+" » "+text, time.Now())
+	}
+	player("Alice", "CAPTURE_IDLE_ALICE")
+	player("Bob", "CAPTURE_IDLE_BOB")
+	discord("Carol", "CAPTURE_IDLE_DISCORD")
+	player("BlockedOne", "CAPTURE_BLOCKED_SECRET")
+	drain(0)
+	if entries := historyEntries(t, r.journal, "Alice", `{"limit":50}`); len(entries) != 3 {
+		t.Fatalf("idle public chat was not retained independently of engagement: %+v", entries)
+	}
+	player("Alice", "grace what did everyone just say")
+	drain(1)
+	for _, marker := range []string{"CAPTURE_IDLE_ALICE", "CAPTURE_IDLE_BOB", "CAPTURE_IDLE_DISCORD"} {
+		if !strings.Contains(requests[0], marker) {
+			t.Fatalf("first permitted request lost idle observation %q", marker)
+		}
+	}
+	player("Bob", "CAPTURE_OTHER_DURING_ACTIVE")
+	drain(1)
+	decision = "continue"
+	player("Alice", "and what about the latest message")
+	drain(2)
+	if !strings.Contains(requests[1], "CAPTURE_OTHER_DURING_ACTIVE") {
+		t.Fatal("active follow-up missed another speaker's captured message")
+	}
+	decision = "disengage"
+	player("Alice", "goodbye")
+	drain(2) // Explicit endings are handled locally, without another model call.
+	player("Alice", "CAPTURE_AFTER_DISENGAGE")
+	drain(2)
+	decision = "continue"
+	player("Alice", "grace back for a moment")
+	drain(3)
+	if !strings.Contains(requests[2], "CAPTURE_AFTER_DISENGAGE") {
+		t.Fatal("reopened conversation lost chat captured after disengagement")
+	}
+	if _, _, ready := a.engagements.take(time.Now().Add(2 * time.Minute)); ready {
+		t.Fatal("silence expiry produced new model work")
+	}
+	player("Alice", "CAPTURE_AFTER_TIMEOUT")
+	drain(3)
+	discord("Carol", "grace what happened while we were quiet")
+	drain(4)
+	if !strings.Contains(requests[3], "CAPTURE_AFTER_TIMEOUT") {
+		t.Fatal("new bridge conversation missed idle Minecraft context")
+	}
+	decision = "disengage"
+	discord("Carol", "and the rest")
+	drain(5)
+	discord("Third Nick", "CAPTURE_BRIDGE_AFTER_DISENGAGE")
+	drain(5)
+	if entries := historyEntries(t, r.journal, "Alice", `{"query":"CAPTURE_BRIDGE_AFTER_DISENGAGE"}`); len(entries) != 1 {
+		t.Fatal("disengaged bridge stopped capturing public messages")
 	}
 }

@@ -50,7 +50,7 @@ func validChatTime(at time.Time) bool {
 }
 
 func validateChatEntry(e *chatEntry) error {
-	if !validChatKind(e.Kind) || !validChatTime(e.At) || strings.TrimSpace(e.Text) == "" || len(e.Text) > maxEventBytes || !utf8.ValidString(e.Text) || len(e.Sender) > 128 {
+	if !validChatKind(e.Kind) || !validChatTime(e.At) || e.Kind != "system" && strings.TrimSpace(e.Text) == "" || len(e.Text) > maxEventBytes || !utf8.ValidString(e.Text) || len(e.Sender) > 128 {
 		return errors.New("invalid chat entry")
 	}
 	e.At = e.At.UTC()
