@@ -60,7 +60,7 @@ func TestActionGameplayOpenButConstructionRequiresAdmin(t *testing.T) {
 	}
 	m := newActionManager(store)
 	m.session = activeActionSession(t)
-	defer m.stopCurrent("test finished")
+	defer m.stopCurrent(context.Background(), "test finished")
 	for _, kind := range []string{"move", "follow", "fight", "mount", "dismount"} {
 		value, err := m.submit(context.Background(), "Alice", kind, &actionJob{})
 		if err != nil {
@@ -69,7 +69,7 @@ func TestActionGameplayOpenButConstructionRequiresAdmin(t *testing.T) {
 		if status := value.(actionStatus); status.Owner != "Alice" || status.Kind != kind || status.State != "queued" {
 			t.Fatalf("action was not admitted: %+v", status)
 		}
-		m.stopCurrent("test next action")
+		m.stopCurrent(context.Background(), "test next action")
 	}
 	build := m.buildTool()
 	args := json.RawMessage(`{"origin":[1,64,1],"size":[1,1,1],"block":"stone"}`)
@@ -108,7 +108,7 @@ func TestActionStopIsCancellationAndMotionBarrier(t *testing.T) {
 	m.current = j
 	m.execMu.Lock()
 	stopped := make(chan struct{})
-	go func() { m.stopCurrent("emergency"); close(stopped) }()
+	go func() { m.stopCurrent(context.Background(), "emergency"); close(stopped) }()
 	select {
 	case <-ctx.Done():
 	case <-time.After(time.Second):

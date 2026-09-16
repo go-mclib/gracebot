@@ -66,7 +66,7 @@ type serverCommands struct {
 	active     *commandCapture
 	window     time.Duration
 	// Set before publishing the tools. Called outside locks before non-discovery commands.
-	BeforeMutation func()
+	BeforeMutation func(context.Context) error
 }
 
 func newServerCommands(store *playerStore) *serverCommands {
@@ -396,7 +396,10 @@ func (s *serverCommands) execute(ctx context.Context, actor, command string) (an
 		default:
 		}
 		if !readonly && s.BeforeMutation != nil {
-			s.BeforeMutation()
+			if err := s.BeforeMutation(ctx); err != nil {
+				finish("not_submitted: could not stop the active action: " + err.Error())
+				return
+			}
 		}
 		if ctx.Err() != nil {
 			finish("cancelled_before_submission")

@@ -121,6 +121,9 @@ func (r *chatRouter) discordChat(ctx context.Context, username, text string, at 
 	}
 	if id != 0 {
 		r.assistant.engagements.observe(discordBridgeActor, display, match[2], at)
+		if r.routeGame(ctx, discordBridgeActor, display, match[2], username) {
+			return true
+		}
 		r.assistant.engagements.enqueue(chatRequest{sender: discordBridgeActor, username: username, ctx: ctx,
 			mentioned: mentioned(match[2], username, r.aliases),
 			messages:  []chatFragment{{ID: id, At: at, Text: match[2], DisplayName: display}}})
@@ -138,6 +141,7 @@ type chatRouter struct {
 	actions      *actionManager
 	consoleChat  bool
 	moderation   *chatModeration
+	games        *gameChat
 }
 
 func (r *chatRouter) playerChat(ctx context.Context, username, sender, message string) {
@@ -173,6 +177,9 @@ func (r *chatRouter) admitChat(ctx context.Context, sender, display, text string
 
 func (r *chatRouter) enqueue(ctx context.Context, username, sender, text string, id uint64, at time.Time, mention bool) {
 	if r.moderation.blocked(sender, at) {
+		return
+	}
+	if r.routeGame(ctx, sender, "", text, username) {
 		return
 	}
 	r.assistant.engagements.enqueue(chatRequest{sender: sender, username: username, ctx: ctx, mentioned: mention,
@@ -361,6 +368,7 @@ func (r *chatRouter) disconnect() {
 		r.commands.bind(nil)
 	}
 	r.assistant.engagements.reset()
+	r.games.reset()
 }
 
 // Upstream chat signing/acknowledgement state is shared by reads and writes.

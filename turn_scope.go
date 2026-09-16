@@ -11,6 +11,7 @@ import (
 // the sensitivity bit remains set so private details never enter automatic context.
 type turnScope struct {
 	actor    string
+	display  string // Untrusted display label for local game participation, never authority.
 	private  atomic.Bool
 	audience atomic.Uint32
 }

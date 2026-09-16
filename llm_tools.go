@@ -15,6 +15,7 @@ type toolSpec struct {
 	name, description string
 	parameters        map[string]any
 	run               func(context.Context, string, json.RawMessage) (any, error)
+	endsTurn          bool // Sends its own deterministic reply; no model narration afterward.
 }
 
 func makeTool(name, description string, properties map[string]any, required []string, run func(context.Context, string, json.RawMessage) (any, error)) toolSpec {
@@ -24,9 +25,9 @@ func makeTool(name, description string, properties map[string]any, required []st
 	if required == nil {
 		required = []string{}
 	}
-	return toolSpec{name, description, map[string]any{
+	return toolSpec{name: name, description: description, parameters: map[string]any{
 		"type": "object", "properties": properties, "required": required, "additionalProperties": false,
-	}, run}
+	}, run: run}
 }
 
 func decodeArgs(raw json.RawMessage, target any) error {

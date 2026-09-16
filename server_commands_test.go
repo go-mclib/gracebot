@@ -44,28 +44,39 @@ func TestServerCommandSafetyAndAuthority(t *testing.T) {
 	if len(sent) != 0 {
 		t.Fatalf("rejected input reached Minecraft: %q", sent)
 	}
-	stopped := false
-	s.BeforeMutation = func() { stopped = true }
-	for _, tc := range []struct {
-		command string
-		stops   bool
-	}{
-		{"/help", false},
-		{"/minecraft:execute as @a run say hello", true},
-	} {
-		stopped = false
+	for _, command := range []string{"/help", "/minecraft:execute as @a run say hello"} {
 		before := len(sent)
-		value, err := s.execute(context.Background(), "Alice", tc.command)
+		value, err := s.execute(context.Background(), "Alice", command)
 		if err != nil {
 			t.Fatal(err)
 		}
 		result := value.(commandResult)
-		if !result.Submitted || result.Confirmed || len(sent) != before+1 || sent[before] != strings.TrimPrefix(tc.command, "/") {
-			t.Fatalf("unranked request %q was not submitted exactly once: %+v; sent=%q", tc.command, result, sent)
+		if !result.Submitted || result.Confirmed || len(sent) != before+1 || sent[before] != strings.TrimPrefix(command, "/") {
+			t.Fatalf("unranked request %q was not submitted exactly once: %+v; sent=%q", command, result, sent)
 		}
-		if stopped != tc.stops {
-			t.Fatalf("command %q interrupted physical action=%t, want %t", tc.command, stopped, tc.stops)
-		}
+	}
+}
+
+func TestServerCommandUnreleasedItemPreventsMutation(t *testing.T) {
+	s := newServerCommands(commandStore(t))
+	s.window = time.Millisecond
+	var sent []string
+	s.bind(func(_ context.Context, command string) error { sent = append(sent, command); return nil })
+	defer s.close()
+	s.BeforeMutation = func(context.Context) error { return errors.New("item release has not reached transport") }
+	value, err := s.execute(context.Background(), "Alice", "spawn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.(commandResult).Submitted || len(sent) != 0 {
+		t.Fatalf("command executed before held use could be released: %+v; sent=%q", value, sent)
+	}
+	value, err = s.execute(context.Background(), "Alice", "help")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !value.(commandResult).Submitted || len(sent) != 1 || sent[0] != "help" {
+		t.Fatalf("read-only discovery was blocked by unrelated held use: %+v; sent=%q", value, sent)
 	}
 }
 
@@ -268,7 +279,7 @@ func TestServerCompletionAuthorityExactInputAndPrivacy(t *testing.T) {
 		return nil
 	})
 	defer s.close()
-	s.BeforeMutation = func() { t.Error("completion interrupted movement") }
+	s.BeforeMutation = func(context.Context) error { t.Error("completion interrupted movement"); return nil }
 	expected := "/pw "
 	calls := 0
 	s.bindCompletion(func(ctx context.Context, input string) (packets.S2CCommandSuggestions, error) {

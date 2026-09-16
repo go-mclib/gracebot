@@ -221,7 +221,10 @@ func (a *assistant) handleRequest(workerCtx context.Context, request chatRequest
 		decision = "disengage"
 		return
 	}
-	ctx, _ = scopedTurn(ctx, request.sender)
+	ctx, scope := scopedTurn(ctx, request.sender)
+	if len(request.messages) > 0 {
+		scope.display = request.messages[len(request.messages)-1].DisplayName
+	}
 	response, err := a.respond(ctx, request)
 	if err != nil {
 		if ctx.Err() == nil {
@@ -403,19 +406,20 @@ func (a *assistant) respond(ctx context.Context, request chatRequest) (turnRespo
 			return empty, fmt.Errorf("AI exceeded tool-call limit")
 		}
 		ids := make(map[string]bool, len(message.ToolCalls))
-		hasResponse := false
+		hasResponse, hasLocalReply := false, false
 		for _, call := range message.ToolCalls {
 			if call.ID == "" || ids[call.ID] || call.Type != openai.ToolTypeFunction {
 				return empty, fmt.Errorf("AI returned invalid tool calls")
 			}
 			ids[call.ID] = true
 			hasResponse = hasResponse || call.Function.Name == responseSpec.name
+			hasLocalReply = hasLocalReply || a.tools.byName[call.Function.Name].endsTurn
 		}
-		if hasResponse && len(message.ToolCalls) != 1 {
+		if (hasResponse || hasLocalReply) && len(message.ToolCalls) != 1 {
 			messages = append(messages, message)
 			for _, call := range message.ToolCalls {
 				messages = append(messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleTool, ToolCallID: call.ID,
-					Content: `{"error":"respond must be called alone after other tools complete; no calls in this batch were executed"}`})
+					Content: `{"error":"reply-producing tools must be called alone after other tools complete; no calls in this batch were executed"}`})
 			}
 			committed = len(messages)
 			calls += len(message.ToolCalls)
@@ -447,11 +451,13 @@ func (a *assistant) respond(ctx context.Context, request chatRequest) (turnRespo
 			return empty, fmt.Errorf("AI exceeded tool-call limit")
 		}
 		messages = append(messages, message)
+		endsTurn := false
 		for _, call := range message.ToolCalls {
 			if version != a.contextVersion.Load() {
 				break
 			}
 			result := a.tools.execute(ctx, request.sender, call)
+			endsTurn = endsTurn || a.tools.byName[call.Function.Name].endsTurn
 			// Preserve only successful moderation state, never arguments,
 			// free-text errors or message-bearing results from the old context.
 			if version != a.contextVersion.Load() && (call.Function.Name == "block_chat" || call.Function.Name == "unblock_chat") {
@@ -472,6 +478,9 @@ func (a *assistant) respond(ctx context.Context, request chatRequest) (turnRespo
 			calls++
 		}
 		committed = len(messages)
+		if endsTurn {
+			return turnResponse{Decision: "disengage"}, nil
+		}
 	}
 	return empty, fmt.Errorf("AI did not finish its response")
 }

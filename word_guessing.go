@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -28,6 +29,10 @@ type wordGame struct {
 	seen         map[string]struct{}
 	revealed     []bool
 	recent       []gameGuess
+	puzzle       string
+	hint         string
+	lower        int
+	upper        int
 }
 
 type gameGuess struct {
@@ -48,6 +53,10 @@ type gameResult struct {
 	Length            int         `json:"length,omitempty"`
 	CustomWord        bool        `json:"custom_word"`
 	Progress          string      `json:"progress,omitempty"`
+	Puzzle            string      `json:"puzzle,omitempty"`
+	Hint              string      `json:"hint,omitempty"`
+	Lower             int         `json:"lower,omitempty"`
+	Upper             int         `json:"upper,omitempty"`
 	MaxAttempts       int         `json:"max_attempts"`
 	Unlimited         bool        `json:"unlimited"`
 	AttemptsUsed      int         `json:"attempts_used"`
@@ -66,17 +75,14 @@ func newGameManager(store *playerStore) *gameManager {
 
 func (m *gameManager) tools() []toolSpec {
 	return []toolSpec{
-		makeTool("start_game", "Start a shared cooperative Hangman or Wordle game. Any player may start. Refuses to replace an active game. Custom words earn no points; never repeat a custom answer in chat. Hangman charges only wrong guesses; Wordle charges every guess.", map[string]any{
-			"game":     map[string]any{"type": "string", "enum": []string{"hangman", "wordle"}},
-			"length":   map[string]any{"type": "integer", "minimum": 3, "maximum": 15, "description": "Default 5 for a random word; inferred from a custom word if omitted."},
-			"word":     map[string]any{"type": "string", "minLength": 3, "maxLength": 15, "pattern": "^[A-Za-z]+$", "description": "Optional custom answer; ASCII English letters only."},
-			"attempts": map[string]any{"type": "integer", "minimum": 0, "description": "Defaults to 6. Explicit 0 means unlimited."},
+		makeTool("start_game", "Start a shared cooperative Hangman, Wordle, anagram, or number game. The runtime sends the built-in game reply directly; do not invent clues or repeat the answer. Refuses to replace an active game. Custom words earn no points. Hangman charges only wrong guesses; other games charge every valid, nonduplicate guess.", map[string]any{
+			"game":     map[string]any{"type": "string", "enum": []string{"hangman", "wordle", "anagram", "number"}},
+			"length":   map[string]any{"type": "integer", "minimum": 3, "maximum": 15, "description": "Word games only. Default 5 for a random word; inferred from a custom word if omitted."},
+			"word":     map[string]any{"type": "string", "minLength": 3, "maxLength": 15, "pattern": "^[A-Za-z]+$", "description": "Word games only. Optional custom answer; ASCII English letters only."},
+			"attempts": map[string]any{"type": "integer", "minimum": 0, "description": "Defaults to 7 for number, 6 otherwise. Explicit 0 means unlimited."},
 		}, []string{"game"}, m.start),
-		makeTool("guess", "Submit a guess to the shared game as the requesting player. Hangman accepts a single letter or a full word; Wordle requires a full word of the game's length. Repeated guesses do not consume attempts. Wordle letter feedback is correct, present, or absent, with duplicate letters counted correctly.", map[string]any{
-			"guess": map[string]any{"type": "string", "minLength": 1, "maxLength": 15, "pattern": "^[A-Za-z]+$"},
-		}, []string{"guess"}, m.guess),
-		makeTool("game_status", "Show the shared game, progress, attempts, and up to ten recent guesses without revealing the active answer. Everyone plays the same game.", nil, nil, m.status),
-		makeTool("stop_game", "Stop the shared game and reveal its answer. Only the player who started it or an administrator may stop it. Stopping awards no points.", nil, nil, m.stop),
+		makeTool("game_status", "Ask the runtime to send the built-in shared game status directly, without revealing the active answer. Everyone plays the same game.", nil, nil, m.status),
+		makeTool("stop_game", "Stop the shared game. The runtime sends the built-in reply and reveals its answer directly. Only the player who started it or an administrator may stop it. Stopping awards no points.", nil, nil, m.stop),
 	}
 }
 
@@ -90,10 +96,16 @@ func (m *gameManager) start(ctx context.Context, actor string, raw json.RawMessa
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, err
 	}
-	if args.Game != "hangman" && args.Game != "wordle" {
-		return nil, fmt.Errorf("game must be hangman or wordle")
+	if args.Game != "hangman" && args.Game != "wordle" && args.Game != "anagram" && args.Game != "number" {
+		return nil, fmt.Errorf("game must be hangman, wordle, anagram, or number")
 	}
 	length, attempts := 5, 6
+	if args.Game == "number" {
+		if args.Length != nil || args.Word != nil {
+			return nil, fmt.Errorf("number games do not accept length or word")
+		}
+		length, attempts = 0, 7
+	}
 	if args.Length != nil {
 		length = *args.Length
 	}
@@ -114,8 +126,11 @@ func (m *gameManager) start(ctx context.Context, actor string, raw json.RawMessa
 		}
 		length = len(word)
 	}
-	if length < 3 || length > 15 {
+	if args.Game != "number" && (length < 3 || length > 15) {
 		return nil, fmt.Errorf("word length must be between 3 and 15")
+	}
+	if args.Game == "anagram" && args.Word != nil && strings.Trim(word, word[:1]) == "" {
+		return nil, fmt.Errorf("anagram words must contain at least two distinct letters")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -125,7 +140,9 @@ func (m *gameManager) start(ctx context.Context, actor string, raw json.RawMessa
 	if m.active != nil {
 		return nil, fmt.Errorf("a shared %s game is already active; finish or stop it first", m.active.game)
 	}
-	if args.Word == nil {
+	if args.Game == "number" {
+		word = strconv.Itoa(rand.IntN(100) + 1)
+	} else if args.Word == nil {
 		var err error
 		word, err = randomGameWord(length)
 		if err != nil {
@@ -135,6 +152,24 @@ func (m *gameManager) start(ctx context.Context, actor string, raw json.RawMessa
 	m.active = &wordGame{
 		game: args.Game, word: word, owner: actor, custom: args.Word != nil,
 		maxAttempts: attempts, seen: make(map[string]struct{}), revealed: make([]bool, length),
+	}
+	if args.Game == "number" {
+		m.active.lower, m.active.upper = 1, 100
+	} else if args.Game == "anagram" {
+		letters := []byte(word)
+		rand.Shuffle(len(letters), func(i, j int) {
+			letters[i], letters[j] = letters[j], letters[i]
+		})
+		// Guarantee the clue differs from the answer without retrying a shuffle.
+		if string(letters) == word {
+			for i := 1; i < len(letters); i++ {
+				if letters[i] != letters[0] {
+					letters[0], letters[i] = letters[i], letters[0]
+					break
+				}
+			}
+		}
+		m.active.puzzle = string(letters)
 	}
 	return m.active.snapshot("active"), nil
 }
@@ -146,10 +181,6 @@ func (m *gameManager) guess(ctx context.Context, actor string, raw json.RawMessa
 	if err := decodeArgs(raw, &args); err != nil {
 		return nil, err
 	}
-	if len(args.Guess) > 15 || !asciiGameWord(args.Guess) {
-		return nil, fmt.Errorf("guess must contain 1 to 15 ASCII English letters")
-	}
-	guess := strings.ToLower(args.Guess)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -159,11 +190,32 @@ func (m *gameManager) guess(ctx context.Context, actor string, raw json.RawMessa
 	if g == nil {
 		return nil, fmt.Errorf("no shared game is active")
 	}
-	if len(guess) != len(g.word) && (g.game != "hangman" || len(guess) != 1) {
-		if g.game == "hangman" {
-			return nil, fmt.Errorf("guess one letter or a %d-letter word", len(g.word))
+	guess := strings.ToLower(args.Guess)
+	number := 0
+	if g.game == "number" {
+		if len(guess) < 1 || len(guess) > 3 {
+			return nil, fmt.Errorf("guess a whole number from 1 to 100")
 		}
-		return nil, fmt.Errorf("guess a %d-letter word", len(g.word))
+		for i := range len(guess) {
+			if guess[i] < '0' || guess[i] > '9' {
+				return nil, fmt.Errorf("guess a whole number from 1 to 100")
+			}
+		}
+		number, _ = strconv.Atoi(guess)
+		if number < 1 || number > 100 {
+			return nil, fmt.Errorf("guess a whole number from 1 to 100")
+		}
+		guess = strconv.Itoa(number)
+	} else {
+		if len(guess) > 15 || !asciiGameWord(guess) {
+			return nil, fmt.Errorf("guess must contain 1 to 15 ASCII English letters")
+		}
+		if len(guess) != len(g.word) && (g.game != "hangman" || len(guess) != 1) {
+			if g.game == "hangman" {
+				return nil, fmt.Errorf("guess one letter or a %d-letter word", len(g.word))
+			}
+			return nil, fmt.Errorf("guess a %d-letter word", len(g.word))
+		}
 	}
 	if _, exists := g.seen[guess]; exists {
 		return nil, fmt.Errorf("that guess was already played; no attempt was used")
@@ -172,14 +224,15 @@ func (m *gameManager) guess(ctx context.Context, actor string, raw json.RawMessa
 	g.guessCount++
 	entry := gameGuess{Player: actor, Guess: guess}
 	won := guess == g.word
-	if g.game == "wordle" {
+	switch g.game {
+	case "wordle":
 		g.attemptsUsed++
 		entry.Correct = won
 		entry.Letters = evaluateWordle(g.word, guess)
 		for i, result := range entry.Letters {
 			g.revealed[i] = result == "correct"
 		}
-	} else {
+	case "hangman":
 		if len(guess) == 1 {
 			for i := range len(g.word) {
 				if g.word[i] == guess[0] {
@@ -201,6 +254,24 @@ func (m *gameManager) guess(ctx context.Context, actor string, raw json.RawMessa
 		}
 		if !entry.Correct {
 			g.attemptsUsed++
+		}
+	case "anagram":
+		g.attemptsUsed++
+		entry.Correct = won
+	case "number":
+		g.attemptsUsed++
+		entry.Correct = won
+		answer, _ := strconv.Atoi(g.word)
+		switch {
+		case number < answer:
+			g.hint = "higher"
+			g.lower = max(g.lower, number+1)
+		case number > answer:
+			g.hint = "lower"
+			g.upper = min(g.upper, number-1)
+		default:
+			g.hint = ""
+			g.lower, g.upper = answer, answer
 		}
 	}
 	if len(g.recent) == gameHistoryLimit {
@@ -264,19 +335,30 @@ func (m *gameManager) stop(ctx context.Context, actor string, raw json.RawMessag
 }
 
 func (g *wordGame) snapshot(status string) gameResult {
-	progress := make([]byte, len(g.word))
-	for i := range progress {
-		progress[i] = '_'
-		if g.revealed[i] {
-			progress[i] = g.word[i]
+	var progress string
+	if g.game != "number" {
+		letters := make([]byte, len(g.word))
+		for i := range letters {
+			letters[i] = '_'
+			if g.revealed[i] {
+				letters[i] = g.word[i]
+			}
 		}
+		progress = string(letters)
 	}
 	result := gameResult{
 		Status: status, Cooperative: true, Game: g.game, Owner: g.owner,
-		Length: len(g.word), CustomWord: g.custom, Progress: string(progress),
+		CustomWord: g.custom, Progress: progress,
+		Puzzle: g.puzzle, Hint: g.hint, Lower: g.lower, Upper: g.upper,
 		MaxAttempts: g.maxAttempts, Unlimited: g.maxAttempts == 0,
 		AttemptsUsed: g.attemptsUsed, GuessCount: g.guessCount,
 		RecentGuesses: append([]gameGuess(nil), g.recent...),
+	}
+	if g.game != "number" {
+		result.Length = len(g.word)
+	}
+	for i := range result.RecentGuesses {
+		result.RecentGuesses[i].Letters = append([]string(nil), g.recent[i].Letters...)
 	}
 	if g.maxAttempts > 0 {
 		remaining := g.maxAttempts - g.attemptsUsed

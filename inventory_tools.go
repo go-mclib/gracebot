@@ -146,5 +146,10 @@ func (m *actionManager) inventoryControl(ctx context.Context, actor string, run 
 		s.stopMotion()
 	}
 	m.execMu.Unlock()
+	if j != nil {
+		if err := j.waitItemUseRelease(ctx); err != nil {
+			return nil, err
+		}
+	}
 	return run()
 }

@@ -186,6 +186,7 @@ func run(ctx context.Context, cfg config) (result error) {
 	output := newChatOutput()
 	output.journal = journal
 	moderation := newChatModeration(store, output.send)
+	games := newGameChat(newGameManager(store), output.send, func(actor string) bool { return moderation.blocked(actor, time.Now()) })
 	activities := newActivities(store, output.send)
 	defer activities.close()
 	web := newWebTools()
@@ -196,16 +197,19 @@ func run(ctx context.Context, cfg config) (result error) {
 	commands := newServerCommands(store)
 	defer commands.close()
 	commands.bindJournal(journal)
-	commands.BeforeMutation = func() { actions.stopCurrent("server command") }
+	commands.BeforeMutation = func(ctx context.Context) error { return actions.stopCurrent(ctx, "server command") }
 	apiConfig := openai.DefaultConfig(cfg.apiKey)
 	apiConfig.BaseURL = cfg.apiBase
-	tools := newToolRegistry(newGameManager(store).tools(), store.tools(), activities.tools(),
+	tools := newToolRegistry(games.tools(), store.tools(), activities.tools(),
 		observations.tools(), inventoryTools(observations, actions), web.tools(), journal.tools(), commands.tools(), actions.tools(), moderation.tools(), operatorTools(store, shutdown), []toolSpec{weatherTool()})
 	tools.blocked = func(actor string) bool { return moderation.blocked(actor, time.Now()) }
 	assistant := newAssistant(openai.NewClientWithConfig(apiConfig), cfg.model, string(personality), tools, output.sendMessage)
 	assistant.journal = journal
 	assistant.moderation = moderation
-	moderation.onChange = assistant.moderationChanged
+	moderation.onChange = func(actor, by string) {
+		assistant.moderationChanged(actor, by)
+		games.forget(actor)
+	}
 	assistant.engagements.timeout = cfg.engagementTimeout
 	assistant.engagements.debounce = cfg.debounce
 	assistant.engagements.setBotNames(cfg.username, cfg.aliases)
@@ -216,8 +220,11 @@ func run(ctx context.Context, cfg config) (result error) {
 	moderationDone := make(chan struct{})
 	go func() { defer close(moderationDone); moderation.run(workerCtx) }()
 	defer func() { stopWorker(); <-moderationDone }()
+	gameDone := make(chan struct{})
+	go func() { defer close(gameDone); games.run(workerCtx) }()
+	defer func() { stopWorker(); <-gameDone }()
 	router := &chatRouter{assistant: assistant, store: store, aliases: cfg.aliases, journal: journal,
-		observations: observations, commands: commands, actions: actions, consoleChat: cfg.consoleChat, moderation: moderation}
+		observations: observations, commands: commands, actions: actions, games: games, consoleChat: cfg.consoleChat, moderation: moderation}
 	if cfg.consoleInput {
 		consoleDone := make(chan struct{})
 		go func() { defer close(consoleDone); readConsoleInput(workerCtx, router, output) }()

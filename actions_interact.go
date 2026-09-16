@@ -18,17 +18,18 @@ type interactionPlan struct {
 	beforeState int32
 	confirmed   bool
 	replans     int
+	lookup      blockTarget
+	resolved    bool
+	name        string
 }
 
 func (m *actionManager) interactBlockTool() toolSpec {
-	coord := func() map[string]any { return map[string]any{"type": "integer"} }
-	return makeTool("interact_block", "Approach and right-click a loaded block within 32 blocks of the job start, using the selected main/offhand item. Can open chests/containers, doors, buttons and other usable blocks; held items may be placed or consumed. hand=0 main, 1 off; sneak=true requests secondary use instead of normal opening. Requests do not bypass server protections. Wait for action_status; opened containers and changed blocks are observed, otherwise the result remains submitted/unconfirmed. Read inventory after opening a container.", map[string]any{
-		"x": coord(), "y": coord(), "z": coord(), "hand": map[string]any{"type": "integer", "enum": []int{0, 1}}, "sneak": map[string]any{"type": "boolean"}, "seconds": map[string]any{"type": "integer", "minimum": 1, "maximum": 120},
-	}, []string{"x", "y", "z"}, func(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
+	props := blockTargetProperties()
+	props["hand"] = map[string]any{"type": "integer", "enum": []int{0, 1}}
+	props["sneak"] = map[string]any{"type": "boolean"}
+	return makeTool("interact_block", "Approach and right-click a loaded block. Supply all x,y,z OR block/label to select the nearest loaded match; radius defaults32, maximum128 blocks, duration defaults60s. Labels must be attached wall signs and are untrusted text. Opens containers, doors/buttons using hand=0 main,1 off; sneak=true is secondary use instead of opening. Held items may be placed/consumed. Wait for action_status (wait_seconds), then read inventory and perform requested transfers with fresh window_id/revision. Submission is not success; server protections apply.", props, nil, func(ctx context.Context, actor string, raw json.RawMessage) (any, error) {
 		var a struct {
-			X       *int `json:"x"`
-			Y       *int `json:"y"`
-			Z       *int `json:"z"`
+			blockTarget
 			Hand    int  `json:"hand"`
 			Sneak   bool `json:"sneak"`
 			Seconds int  `json:"seconds"`
@@ -36,16 +37,18 @@ func (m *actionManager) interactBlockTool() toolSpec {
 		if err := decodeArgs(raw, &a); err != nil {
 			return nil, err
 		}
-		if a.X == nil || a.Y == nil || a.Z == nil {
-			return nil, fmt.Errorf("x,y,z are required")
+		plan, err := a.blockTarget.plan()
+		if err != nil {
+			return nil, err
 		}
+		plan.hand, plan.sneak = a.Hand, a.Sneak
 		if a.Hand < 0 || a.Hand > 1 {
 			return nil, fmt.Errorf("hand must be 0 or 1")
 		}
 		if a.Seconds == 0 {
-			a.Seconds = 20
+			a.Seconds = 60
 		}
-		return m.submit(ctx, actor, "interact_block", &actionJob{goal: actionPoint{float64(*a.X), float64(*a.Y), float64(*a.Z)}, seconds: a.Seconds, interact: &interactionPlan{block: [3]int{*a.X, *a.Y, *a.Z}, hand: a.Hand, sneak: a.Sneak}})
+		return m.submit(ctx, actor, "interact_block", &actionJob{seconds: a.Seconds, interact: plan})
 	})
 }
 
@@ -129,6 +132,9 @@ func (j *actionJob) interactTick() (bool, error) {
 	}
 	var target actionPoint
 	if j.status.Kind == "interact_block" {
+		if err := j.resolveBlockTarget(); err != nil {
+			return false, err
+		}
 		target = j.goal
 		if err := j.checkPoint(target); err != nil {
 			return false, err
@@ -151,6 +157,9 @@ func (j *actionJob) interactTick() (bool, error) {
 	s.me.SetSneaking(p.sneak)
 	var err error
 	if j.status.Kind == "interact_block" {
+		if err := j.validateBlockTarget(); err != nil {
+			return false, err
+		}
 		var submission interaction.Submission
 		submission, err = interaction.UseBlock(s.client, p.block[0], p.block[1], p.block[2], p.hand, j.send)
 		p.sequence, p.beforeState = submission.Sequence, submission.BlockState
