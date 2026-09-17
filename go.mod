@@ -6,7 +6,7 @@ require (
 	github.com/anthropics/anthropic-sdk-go v1.73.0
 	github.com/go-mclib/client v0.0.0-20260916165117-d5aa8019e1dd
 	github.com/go-mclib/data v0.0.0-20260916164751-62db3b240f53
-	github.com/go-mclib/nbt v0.0.0
+	github.com/go-mclib/nbt v0.1.0
 	github.com/go-mclib/protocol v0.0.0-20260915052648-6c01ecdcc533
 	github.com/sashabaranov/go-openai v1.41.2
 	golang.org/x/net v0.59.0
@@ -58,6 +58,3 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
 )
-
-// NBT is an unpublished module provided by the go-mclib workspace.
-replace github.com/go-mclib/nbt => ../nbt
