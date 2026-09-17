@@ -132,7 +132,7 @@ func TestActionStopIsCancellationAndMotionBarrier(t *testing.T) {
 	if m.current != nil || len(m.history) != 1 || m.history[0].State != "cancelled" {
 		t.Fatal("cancelled job outcome lost")
 	}
-	if err := j.send(&packets.C2SSwing{}); err != context.Canceled {
+	if err := j.send(&packets.C2SPunch{}); err != context.Canceled {
 		t.Fatalf("cancelled job submitted an effect: %v", err)
 	}
 }

@@ -4,10 +4,10 @@ go 1.26.0
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.73.0
-	github.com/go-mclib/client v0.0.0-20260916165117-d5aa8019e1dd
-	github.com/go-mclib/data v0.0.0-20260916164751-62db3b240f53
+	github.com/go-mclib/client v0.0.0-20260917155225-9946101cab31
+	github.com/go-mclib/data v0.0.0-20260917155106-4cca9d7f011f
 	github.com/go-mclib/nbt v0.1.0
-	github.com/go-mclib/protocol v0.0.0-20260915052648-6c01ecdcc533
+	github.com/go-mclib/protocol v0.0.0-20260917154622-8c6e1640304a
 	github.com/sashabaranov/go-openai v1.41.2
 	golang.org/x/net v0.59.0
 	modernc.org/sqlite v1.58.0
