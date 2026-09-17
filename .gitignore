@@ -9,3 +9,6 @@ gracebot.db
 gracebot.db-wal
 gracebot.db-shm
 chat_archives/
+
+go.work
+go.work.sum
