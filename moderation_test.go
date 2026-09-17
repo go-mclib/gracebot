@@ -174,7 +174,7 @@ func TestBlockingDuringModelRequestCancelsOutputAndCachedContext(t *testing.T) {
 	r, m := moderationFixture(t)
 	started := make(chan struct{})
 	done := make(chan struct{})
-	r.assistant.client = completionFunc(func(ctx context.Context, _ openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+	r.assistant.client = completionFunc(func(ctx context.Context, _ completionRequest) (openai.ChatCompletionResponse, error) {
 		close(started)
 		<-ctx.Done()
 		return responseCompletion("continue", "obsolete response"), nil // Deliberately late provider reply.
@@ -206,7 +206,7 @@ func TestAdminToolBlockRebuildsContextBeforeNextModelCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	calls := 0
-	r.assistant.client = completionFunc(func(_ context.Context, request openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+	r.assistant.client = completionFunc(func(_ context.Context, request completionRequest) (openai.ChatCompletionResponse, error) {
 		calls++
 		data, _ := json.Marshal(request.Messages)
 		if calls == 1 {
@@ -252,7 +252,7 @@ func TestUnblockOutcomeSurvivesModerationContextReset(t *testing.T) {
 		t.Fatal(err)
 	}
 	calls := 0
-	r.assistant.client = completionFunc(func(_ context.Context, request openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+	r.assistant.client = completionFunc(func(_ context.Context, request completionRequest) (openai.ChatCompletionResponse, error) {
 		calls++
 		if calls == 1 {
 			return completionMessage(openai.ChatCompletionMessage{ToolCalls: []openai.ToolCall{{

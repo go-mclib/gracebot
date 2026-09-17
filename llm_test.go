@@ -13,9 +13,9 @@ import (
 	"github.com/sashabaranov/go-openai"
 )
 
-type completionFunc func(context.Context, openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error)
+type completionFunc func(context.Context, completionRequest) (openai.ChatCompletionResponse, error)
 
-func (f completionFunc) CreateChatCompletion(ctx context.Context, req openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+func (f completionFunc) CreateChatCompletion(ctx context.Context, req completionRequest) (openai.ChatCompletionResponse, error) {
 	return f(ctx, req)
 }
 func completionMessage(message openai.ChatCompletionMessage) openai.ChatCompletionResponse {
@@ -38,7 +38,7 @@ func TestStructuredRepliesNeverPublishCommentaryOrSpeakerPrefixes(t *testing.T) 
 	var published []string
 	out.bind(func(_ context.Context, text string) error { published = append(published, text); return nil }, "GraceLocal")
 	want := []string{"&ahey whats up&r", `<hover:show_text:'<gold>gold'>hello</hover>`}
-	api := completionFunc(func(context.Context, openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+	api := completionFunc(func(context.Context, completionRequest) (openai.ChatCompletionResponse, error) {
 		response := responseCompletion("disengage", want...)
 		response.Choices[0].Message.Content = "<thinking>private commentary mentioning Alice</thinking>\nAlice: copied transcript"
 		return response, nil
@@ -61,7 +61,7 @@ func TestInvalidPublicOutputCannotLeakOrSplitIntoChat(t *testing.T) {
 	for name, message := range cases {
 		t.Run(name, func(t *testing.T) {
 			published, requests := 0, 0
-			a := newAssistant(completionFunc(func(context.Context, openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+			a := newAssistant(completionFunc(func(context.Context, completionRequest) (openai.ChatCompletionResponse, error) {
 				requests++
 				return completionMessage(message), nil
 			}), "model", "", newToolRegistry(), func(context.Context, string) error { published++; return nil })
@@ -76,7 +76,7 @@ func TestInvalidPublicOutputCannotLeakOrSplitIntoChat(t *testing.T) {
 func TestWaitingAndDisengagingAreSilentUntilNewInput(t *testing.T) {
 	answers := []string{"wait", "continue"}
 	calls, replies := 0, 0
-	a := newAssistant(completionFunc(func(context.Context, openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+	a := newAssistant(completionFunc(func(context.Context, completionRequest) (openai.ChatCompletionResponse, error) {
 		decision := answers[calls]
 		calls++
 		if decision == "continue" {
@@ -124,7 +124,7 @@ func TestNewInputCancelsRemainingEffectsWithinToolBatch(t *testing.T) {
 		a.engagements.enqueue(fragmentRequest(context.Background(), actor, "actually stop", at.Add(3*time.Second), false, 2))
 		return points, nil
 	})})
-	api := completionFunc(func(context.Context, openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+	api := completionFunc(func(context.Context, completionRequest) (openai.ChatCompletionResponse, error) {
 		return completionMessage(openai.ChatCompletionMessage{ToolCalls: []openai.ToolCall{
 			{ID: "first", Type: openai.ToolTypeFunction, Function: openai.FunctionCall{Name: "award", Arguments: `{}`}},
 			{ID: "second", Type: openai.ToolTypeFunction, Function: openai.FunctionCall{Name: "award", Arguments: `{}`}},
@@ -143,7 +143,7 @@ func TestNewInputCancelsRemainingEffectsWithinToolBatch(t *testing.T) {
 func TestToolConversationRetainsCompleteProtocolExchanges(t *testing.T) {
 	store := testPlayerStore(t)
 	calls := 0
-	api := completionFunc(func(_ context.Context, req openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+	api := completionFunc(func(_ context.Context, req completionRequest) (openai.ChatCompletionResponse, error) {
 		pending := map[string]bool{}
 		for _, message := range req.Messages {
 			for _, call := range message.ToolCalls {
@@ -182,7 +182,7 @@ func TestToolConversationRetainsCompleteProtocolExchanges(t *testing.T) {
 func TestToolLoopIsBounded(t *testing.T) {
 	calls := 0
 	tools := newToolRegistry([]toolSpec{makeTool("action", "stateful action", nil, nil, func(context.Context, string, json.RawMessage) (any, error) { calls++; return "done", nil })})
-	api := completionFunc(func(context.Context, openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+	api := completionFunc(func(context.Context, completionRequest) (openai.ChatCompletionResponse, error) {
 		return completionMessage(openai.ChatCompletionMessage{ToolCalls: []openai.ToolCall{{ID: fmt.Sprint(calls), Type: openai.ToolTypeFunction,
 			Function: openai.FunctionCall{Name: "action", Arguments: `{}`}}}}), nil
 	})
@@ -263,7 +263,7 @@ func TestPrivateToolDataCannotEscapeThroughCurrentOrCachedReplies(t *testing.T) 
 				return nil
 			})
 			calls := 0
-			api := completionFunc(func(_ context.Context, request openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+			api := completionFunc(func(_ context.Context, request completionRequest) (openai.ChatCompletionResponse, error) {
 				calls++
 				data, _ := json.Marshal(request.Messages)
 				if calls == 1 || calls == 4 {
@@ -332,7 +332,7 @@ func TestRequestedAudienceCanReturnFromWhispersToPublicChat(t *testing.T) {
 		return nil
 	})
 	calls := 0
-	api := completionFunc(func(ctx context.Context, _ openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+	api := completionFunc(func(ctx context.Context, _ completionRequest) (openai.ChatCompletionResponse, error) {
 		calls++
 		audience, text := "private", "a private hello"
 		if calls == 2 {
@@ -367,7 +367,7 @@ func TestIdleChatIsCapturedWithoutCallingModel(t *testing.T) {
 	}
 	var requests []string
 	decision := "wait"
-	a.client = completionFunc(func(_ context.Context, request openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+	a.client = completionFunc(func(_ context.Context, request completionRequest) (openai.ChatCompletionResponse, error) {
 		data, err := json.Marshal(request.Messages)
 		if err != nil {
 			t.Fatal(err)

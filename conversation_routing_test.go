@@ -196,7 +196,7 @@ func TestConversationEndingsCancelWithoutAnotherTurn(t *testing.T) {
 func TestAudienceRoutingAPICounter(t *testing.T) {
 	calls := 0
 	decision := "continue"
-	a := newAssistant(completionFunc(func(context.Context, openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+	a := newAssistant(completionFunc(func(context.Context, completionRequest) (openai.ChatCompletionResponse, error) {
 		calls++
 		if decision == "continue" {
 			return responseCompletion(decision, "sure"), nil

@@ -26,7 +26,6 @@ import (
 	"github.com/go-mclib/client/modules/world"
 	"github.com/go-mclib/data"
 	"github.com/go-mclib/data/packets"
-	"github.com/sashabaranov/go-openai"
 )
 
 type config struct {
@@ -75,7 +74,7 @@ func readConfig(args []string) (config, error) {
 	flags.IntVar(&cfg.reconnects, "reconnects", -1, "reconnect attempts (-1 unlimited, 0 none)")
 	flags.StringVar(&cfg.brand, "b", "gracebot", "Minecraft client brand")
 	flags.StringVar(&aliases, "a", aliases, "comma-separated case-insensitive aliases; empty means current username only")
-	flags.StringVar(&cfg.apiBase, "api-base", cfg.apiBase, "OpenAI-compatible API base URL (LLM_BASE_URL)")
+	flags.StringVar(&cfg.apiBase, "api-base", cfg.apiBase, "Anthropic or OpenAI-compatible API base URL (LLM_BASE_URL)")
 	flags.StringVar(&cfg.model, "model", cfg.model, "tool-capable chat model (LLM_MODEL)")
 	flags.StringVar(&cfg.personalityPath, "personality", "personality.txt", "optional personality text file")
 	flags.StringVar(&cfg.databasePath, "database", "gracebot.db", "SQLite chat, memory, scores and ranks database")
@@ -198,12 +197,10 @@ func run(ctx context.Context, cfg config) (result error) {
 	defer commands.close()
 	commands.bindJournal(journal)
 	commands.BeforeMutation = func(ctx context.Context) error { return actions.stopCurrent(ctx, "server command") }
-	apiConfig := openai.DefaultConfig(cfg.apiKey)
-	apiConfig.BaseURL = cfg.apiBase
 	tools := newToolRegistry(games.tools(), store.tools(), activities.tools(),
 		observations.tools(), inventoryTools(observations, actions), web.tools(), journal.tools(), commands.tools(), actions.tools(), moderation.tools(), operatorTools(store, shutdown), []toolSpec{weatherTool()})
 	tools.blocked = func(actor string) bool { return moderation.blocked(actor, time.Now()) }
-	assistant := newAssistant(openai.NewClientWithConfig(apiConfig), cfg.model, string(personality), tools, output.sendMessage)
+	assistant := newAssistant(newChatCompletionClient(cfg), cfg.model, string(personality), tools, output.sendMessage)
 	assistant.journal = journal
 	assistant.moderation = moderation
 	moderation.onChange = func(actor, by string) {

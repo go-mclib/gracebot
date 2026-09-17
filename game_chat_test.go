@@ -91,7 +91,7 @@ func TestLocalGameAnagramAnyoneCanGuessWithoutJoining(t *testing.T) {
 func TestLocalGameGuessesNeverCallOrUseModelNarration(t *testing.T) {
 	r, g, ctx, replies := localGameFixture(t)
 	calls := 0
-	r.assistant.client = completionFunc(func(context.Context, openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+	r.assistant.client = completionFunc(func(context.Context, completionRequest) (openai.ChatCompletionResponse, error) {
 		calls++
 		return openai.ChatCompletionResponse{Choices: []openai.ChatCompletionChoice{{Message: openai.ChatCompletionMessage{
 			Role: "assistant", Content: "fabricated game clue", ToolCalls: []openai.ToolCall{{ID: "start", Type: openai.ToolTypeFunction, Function: openai.FunctionCall{Name: "start_game", Arguments: `{"game":"wordle","word":"music"}`}}},

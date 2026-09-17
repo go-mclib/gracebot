@@ -28,8 +28,15 @@ const (
 	maxReplyMessageBytes = 200
 )
 
+// historyEnd excludes per-request background, timestamps and current input from
+// the reusable completed-history prefix. Zero means there is no history yet.
+type completionRequest struct {
+	openai.ChatCompletionRequest
+	historyEnd int
+}
+
 type chatCompletionClient interface {
-	CreateChatCompletion(context.Context, openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error)
+	CreateChatCompletion(context.Context, completionRequest) (openai.ChatCompletionResponse, error)
 }
 
 type chatFragment struct {
@@ -310,25 +317,29 @@ func (a *assistant) respond(ctx context.Context, request chatRequest) (turnRespo
 	identity, _ := json.Marshal(map[string]any{
 		"bot_username": request.username, "requesting_player": request.sender,
 		"requester_is_admin": a.moderation != nil && a.moderation.store.hasRank(request.sender, "admin"),
-		"current_time_utc":   time.Now().UTC().Format(time.RFC3339), "current_request_event_id": latest,
 	})
 	messages := []openai.ChatCompletionMessage{
 		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt + "\n\n" + a.personality},
 		{Role: openai.ChatMessageRoleSystem, Content: "Runtime identity: " + string(identity)},
 	}
 	if conv.omittedHistory {
-		messages = append(messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant,
+		messages = append(messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleSystem,
 			Content: "Older completed turns omitted. Do not replay past actions. Retrieve chat_history or inspect current state if earlier details are needed."})
 	}
 	for _, turn := range conv.turns {
 		messages = append(messages, turn...)
+	}
+	historyEnd := 0
+	if len(messages) > 2 {
+		historyEnd = len(messages)
 	}
 	if recent := backgroundContext(a.journal.recentContext(first, request.sender), conv.turns); recent != "" {
 		messages = append(messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: recent})
 	}
 	start := len(messages)
 	input, _ := json.Marshal(map[string]any{"speaker": request.sender, "mentioned": request.mentioned,
-		"messages": request.messages, "earlier_batch_messages_omitted": request.omitted})
+		"messages": request.messages, "earlier_batch_messages_omitted": request.omitted,
+		"current_time_utc": time.Now().UTC().Format(time.RFC3339), "current_request_event_id": latest})
 	messages = append(messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: string(input)})
 	// Retain completed effects across interruptions without carrying private
 	// result text into later public input. Owners can retrieve private details
@@ -365,6 +376,7 @@ func (a *assistant) respond(ctx context.Context, request chatRequest) (turnRespo
 			// Retain the current administrator's request and completed effects,
 			// not pre-block observations or results containing message content.
 			messages = messages[:2:2]
+			historyEnd = 0
 			if recent := backgroundContext(a.journal.recentContext(first, request.sender), nil); recent != "" {
 				messages = append(messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: recent})
 			}
@@ -380,9 +392,11 @@ func (a *assistant) respond(ctx context.Context, request chatRequest) (turnRespo
 			}
 			committed = len(messages)
 		}
-		req := openai.ChatCompletionRequest{Model: a.model, Messages: messages, MaxTokens: 1024, Tools: a.definitions, ToolChoice: "required"}
+		req := completionRequest{
+			ChatCompletionRequest: openai.ChatCompletionRequest{Model: a.model, Messages: messages, MaxTokens: 1024, Tools: a.definitions, ToolChoice: "required"},
+			historyEnd:            historyEnd,
+		}
 		if round == maxToolRounds || calls >= maxCallsPerTurn {
-			req.Tools = []openai.Tool{responseTool}
 			req.ToolChoice = responseChoice
 		}
 		resp, err := a.client.CreateChatCompletion(ctx, req)

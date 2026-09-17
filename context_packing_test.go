@@ -20,7 +20,7 @@ func TestHistoricalPackingKeepsReceiptsAndCurrentResults(t *testing.T) {
 	})
 	calls := 0
 	var prior []openai.ChatCompletionMessage
-	api := completionFunc(func(_ context.Context, req openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+	api := completionFunc(func(_ context.Context, req completionRequest) (openai.ChatCompletionResponse, error) {
 		calls++
 		available := make(map[string]bool)
 		for _, tool := range req.Tools {
@@ -150,7 +150,7 @@ func TestAutomaticContextHasByteAndTurnBounds(t *testing.T) {
 
 func TestNewEngagementDiscardsStaleTurnContext(t *testing.T) {
 	calls := 0
-	a := newAssistant(completionFunc(func(_ context.Context, req openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+	a := newAssistant(completionFunc(func(_ context.Context, req completionRequest) (openai.ChatCompletionResponse, error) {
 		calls++
 		data, _ := json.Marshal(req.Messages)
 		if calls == 2 && !strings.Contains(string(data), "OLD_ENGAGEMENT_DETAIL") {
@@ -178,7 +178,7 @@ func TestNewEngagementDiscardsStaleTurnContext(t *testing.T) {
 }
 
 func TestFailedCompletionDoesNotKeepAmbientEngagement(t *testing.T) {
-	a := newAssistant(completionFunc(func(context.Context, openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+	a := newAssistant(completionFunc(func(context.Context, completionRequest) (openai.ChatCompletionResponse, error) {
 		return openai.ChatCompletionResponse{}, fmt.Errorf("provider unavailable")
 	}), "model", "", nil, nil)
 	defer a.engagements.reset()
@@ -191,5 +191,61 @@ func TestFailedCompletionDoesNotKeepAmbientEngagement(t *testing.T) {
 	a.handleRequest(context.Background(), r)
 	if a.engagements.enqueue(fragmentRequest(context.Background(), "Alice", "yes", at.Add(4*time.Second), false, 2)) {
 		t.Fatal("failed one-off request kept ambient conversation open")
+	}
+}
+
+func TestCachePrefixSurvivesFreshInputAndBackground(t *testing.T) {
+	journal := testPlayerStore(t).history()
+	var prefix string
+	var prefixEnd int
+	var eventID uint64
+	calls := 0
+	a := newAssistant(completionFunc(func(_ context.Context, req completionRequest) (openai.ChatCompletionResponse, error) {
+		calls++
+		if calls > 1 {
+			if req.historyEnd <= 2 {
+				t.Fatal("completed conversation has no reusable history prefix")
+			}
+			data, _ := json.Marshal(req.Messages[:req.historyEnd])
+			if strings.Contains(string(data), fmt.Sprintf("BACKGROUND_%d", calls)) {
+				t.Fatal("fresh background invalidates the completed-history cache")
+			}
+			if calls == 2 {
+				prefix, prefixEnd = string(data), req.historyEnd
+			} else {
+				data, _ = json.Marshal(req.Messages[:prefixEnd])
+				if string(data) != prefix {
+					t.Fatal("fresh request changed an already cacheable history prefix")
+				}
+			}
+		}
+		var input struct {
+			EventID uint64 `json:"current_request_event_id"`
+			At      string `json:"current_time_utc"`
+		}
+		if err := json.Unmarshal([]byte(req.Messages[len(req.Messages)-1].Content), &input); err != nil || input.EventID != eventID {
+			t.Fatalf("current request lost its runtime event: %+v, %v", input, err)
+		}
+		if _, err := time.Parse(time.RFC3339, input.At); err != nil {
+			t.Fatalf("current request lost its runtime clock: %v", err)
+		}
+		return responseCompletion("continue", "what next?"), nil
+	}), "model", "", nil, nil)
+	a.journal = journal
+	for i := 1; i <= 3; i++ {
+		at := time.Now()
+		if _, err := journal.append("player", "Bob", fmt.Sprintf("BACKGROUND_%d", i), at); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		eventID, err = journal.append("player", "Alice", fmt.Sprintf("REQUEST_%d", i), at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := fragmentRequest(context.Background(), "Alice", fmt.Sprintf("REQUEST_%d", i), at, true, eventID)
+		r.conversationID = 1
+		if _, err := a.respond(context.Background(), r); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
