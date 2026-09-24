@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.73.0
-	github.com/go-mclib/client v0.0.0-20260917155225-9946101cab31
+	github.com/go-mclib/client v0.0.0-20260924165420-7ed5f2dce51f
 	github.com/go-mclib/data v0.0.0-20260917155106-4cca9d7f011f
 	github.com/go-mclib/nbt v0.1.0
 	github.com/go-mclib/protocol v0.0.0-20260917154622-8c6e1640304a

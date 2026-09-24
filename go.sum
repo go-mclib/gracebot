@@ -36,8 +36,8 @@ github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkp
 github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto=
 github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f h1:Y/CXytFA4m6baUTXGLOoWe4PQhGxaX0KpnayAqC48p4=
 github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f/go.mod h1:vw97MGsxSvLiUE2X8qFplwetxpGLQrlU1Q9AUEIzCaM=
-github.com/go-mclib/client v0.0.0-20260917155225-9946101cab31 h1:p2eWfGct7or/T/7hG48/YxPmDFQbGgit1QUJoO/Ns9o=
-github.com/go-mclib/client v0.0.0-20260917155225-9946101cab31/go.mod h1:kk9aQ2mRWW/HEFbKODYrLiO7MvcPfCmA18paLptMGnk=
+github.com/go-mclib/client v0.0.0-20260924165420-7ed5f2dce51f h1:8WuuNtppcVo5ly+mh3uPP2dFzqkivWjx4+yQ+JVfL54=
+github.com/go-mclib/client v0.0.0-20260924165420-7ed5f2dce51f/go.mod h1:kk9aQ2mRWW/HEFbKODYrLiO7MvcPfCmA18paLptMGnk=
 github.com/go-mclib/data v0.0.0-20260917155106-4cca9d7f011f h1:GgTdmW3+DBzLmllxJbfICLT16+dpJDpn5t6/N2UNSFA=
 github.com/go-mclib/data v0.0.0-20260917155106-4cca9d7f011f/go.mod h1:x55BrZk7eS+Ede0FUOICw5QEREyucIFSMB0GQAuirzc=
 github.com/go-mclib/nbt v0.1.0 h1:QoUm5C59yOHEhrVqCKLgJN9FC1ZUViUvboVkwOv045A=
